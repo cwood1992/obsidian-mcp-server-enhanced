@@ -4,19 +4,23 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-PLIST_FILE="$PROJECT_DIR/com.obsidian.mcp.plist"
+PLIST_TEMPLATE="$PROJECT_DIR/com.obsidian.mcp.plist"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LAUNCH_AGENT_FILE="$LAUNCH_AGENTS_DIR/com.obsidian.mcp.plist"
 
 echo "Setting up MCP auto-start..."
 
 # Create LaunchAgents directory if it doesn't exist
 mkdir -p "$LAUNCH_AGENTS_DIR"
 
-# Copy plist file to LaunchAgents
-cp "$PLIST_FILE" "$LAUNCH_AGENTS_DIR/"
+# Render plist template to LaunchAgents
+sed \
+  -e "s|{{PROJECT_PATH}}|$PROJECT_DIR|g" \
+  -e "s|{{HOME}}|$HOME|g" \
+  "$PLIST_TEMPLATE" > "$LAUNCH_AGENT_FILE"
 
 # Load the launch agent
-launchctl load "$LAUNCH_AGENTS_DIR/com.obsidian.mcp.plist"
+launchctl load "$LAUNCH_AGENT_FILE"
 
 echo "✓ Auto-start configured successfully!"
 echo

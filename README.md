@@ -171,6 +171,9 @@ If running directly, they can be set in a `.env` file in the project root or dir
 | `CHATGPT_LAYER_ENABLED`               | Set to `true` to serve the ChatGPT manifest plus JSON action endpoint. | No | `false` |
 | `CHATGPT_MANIFEST_PATH`               | HTTP path that exposes the ChatGPT manifest JSON.         | No                | `/.well-known/obsidian-chatgpt-manifest.json` |
 | `CHATGPT_ACTIONS_PATH`                | HTTP path for ChatGPT JSON actions (POST).                | No                | `/chatgpt/actions`       |
+| `CHATGPT_FACADE_TOKEN_TTL_SECONDS`    | ChatGPT facade access-token lifetime.                     | No                | `3600`                   |
+| `CHATGPT_FACADE_REFRESH_TOKEN_TTL_SECONDS` | ChatGPT facade refresh-token lifetime.                | No                | `2592000`                |
+| `CHATGPT_FACADE_SCOPES`               | Comma-separated ChatGPT facade scopes. Add write scopes only for explicitly trusted clients. | No | `obsidian:read` |
 | `MCP_LOG_LEVEL`                       | Logging level (`debug`, `info`, `error`, etc.).           | No                | `info`                   |
 | `OBSIDIAN_VERIFY_SSL`                 | Set to `false` to disable SSL verification.               | No                | `true`                   |
 | `OBSIDIAN_ENABLE_CACHE`               | Set to `true` to enable the in-memory vault cache.        | No                | `true`                   |
@@ -394,60 +397,110 @@ Use obsidian_dataview_query with vault="work" to run: TABLE file.name FROM #meet
 
 > **🚀 Pro Tip**: For production use, set up [automatic startup on boot](./scripts/autostart/README.md) so your server and Tailscale Funnel start automatically without manual intervention.
 
-## 🤖 ChatGPT MCP Layer
+## ChatGPT Connector Facade
 
-Claude connects directly to `/mcp`, but ChatGPT’s Actions workflow expects an HTTP manifest plus REST-style JSON endpoints. The ChatGPT layer wraps the existing MCP server so you can reuse all transports, vault routing, and task logic without duplicating code.
+Claude and local MCP clients can connect directly to `/mcp`. Hosted ChatGPT
+connectors should use the separate `obsidian-chatgpt` facade instead. The
+facade reuses the existing vault, search, and task logic internally, but it has
+its own process, port, OAuth/PKCE authorization flow, scoped capabilities, and
+write audit log.
 
-### Enabling the layer
+Use the facade for public HTTPS or Tailscale Funnel routes. Keep the full MCP
+server on localhost or private tailnet-only routes unless you are doing an
+explicit local/dev test.
 
-1. Add `CHATGPT_LAYER_ENABLED=true` to your environment (other knobs: `CHATGPT_MANIFEST_PATH`, `CHATGPT_ACTIONS_PATH`).
-2. Restart the server (`npm run build && npm run start:http`).
-3. Fetch the manifest to confirm availability:
-   ```bash
-   curl "http://127.0.0.1:3010/.well-known/obsidian-chatgpt-manifest.json"
-   ```
+### Starting the Facade
 
-The manifest advertises the MCP endpoint plus a single JSON actions route (`/chatgpt/actions`). Both endpoints reuse the same `MCP_AUTH_KEY` query parameter, so you can deploy Tailscale/Claude and ChatGPT in parallel without new auth plumbing.
+Configure a public resource URL and admin approval secret, then start the
+facade:
 
-### Available ChatGPT actions
-
-| Action        | Description                                                                                 | Backed By                         |
-| :------------ | :------------------------------------------------------------------------------------------ | :-------------------------------- |
-| `searchNotes` | Global search with regex/date filters, pagination, and cache fallback.                      | `processObsidianGlobalSearch`     |
-| `fetchPage`   | Fetch markdown or JSON for a note.                                                          | `ObsidianRestApiService.getFileContent` |
-| `updatePage`  | Append, prepend, or overwrite a note via whole-file writes.                                 | `ObsidianRestApiService` methods  |
-| `taskQuery`   | Tasks plugin query engine with summaries and formatted output.                              | `obsidianTaskQueryLogic`          |
-| `taskCreate`  | Rich task insertion (headings, periodic notes, metadata).                                   | `obsidianCreateTaskLogic`         |
-| `taskUpdate`  | Update status/metadata or relocate an existing task.                                        | `obsidianUpdateTaskLogic`         |
-
-All actions accept an optional `vault` field (defaults to the first configured vault). Requests are JSON payloads of the form:
-
-```json
-POST /chatgpt/actions?api_key=YOUR_MCP_AUTH_KEY
-{
-  "action": "searchNotes",
-  "vault": "work",
-  "parameters": {
-    "query": "project alpha",
-    "searchInPath": "Projects/Alpha",
-    "modified_since": "last week",
-    "pageSize": 20
-  }
-}
+```bash
+export CHATGPT_FACADE_PUBLIC_URL="https://your-device.your-tailnet.ts.net"
+export CHATGPT_FACADE_ADMIN_SECRET="$(openssl rand -hex 24)"
+npm run build
+npm run start:chatgpt
 ```
 
-Responses wrap the existing tool result objects:
+If the same Funnel hostname also exposes another ChatGPT connector, give this
+facade a path-scoped resource URL such as
+`https://your-device.your-tailnet.ts.net/obsidian` and route the `/obsidian`
+prefix to the facade port. The facade serves both root and path-qualified
+well-known metadata paths for that setup. In that shared-host setup, create the
+connector with `https://your-device.your-tailnet.ts.net/obsidian/mcp`.
 
-```json
-{
-  "success": true,
-  "action": "searchNotes",
-  "vault": "work",
-  "data": { "results": [...], "totalFilesFound": 5, "currentPage": 1, ... }
-}
+Check health:
+
+```bash
+curl "http://127.0.0.1:3020/health"
 ```
 
-Use the manifest output inside ChatGPT’s Actions editor (or any HTTP client) to describe the available capabilities while keeping Claude/Tailscale flows unchanged.
+For facade HTTP-surface tests without a live Obsidian API, set
+`CHATGPT_FACADE_SKIP_OBSIDIAN_CHECK=true`. Leave it unset for normal operation.
+
+Expose only the facade through Funnel:
+
+```bash
+make tailscale-funnel-chatgpt
+```
+
+### OAuth and Scopes
+
+The facade publishes OAuth discovery metadata:
+
+- `/.well-known/oauth-protected-resource`
+- `/.well-known/oauth-authorization-server`
+- `/.well-known/openid-configuration`
+
+It stores authorization-code, access-token, and refresh-token hashes locally
+under `CHATGPT_FACADE_STORE_PATH`, not raw tokens. It requires PKCE S256 for
+initial token exchange, supports refresh-token rotation, and validates bearer
+tokens by resource, expiry, and scope before executing actions.
+
+Scopes:
+
+- `obsidian:read`: `search`, `fetch`, `task_query`
+- `obsidian:write`: `create_task`, `update_task`, `append_note`
+- `obsidian:dangerous-write`: `overwrite_note`
+
+Read-only connector setup is the default and is supported by granting only
+`obsidian:read`.
+`overwrite_note` is not available unless `obsidian:dangerous-write` is
+explicitly granted.
+
+### Facade Actions
+
+All actions use `POST /chatgpt/actions` with `Authorization: Bearer <token>`.
+They accept an optional `vault` field. The default public surface is intentionally
+smaller than the full local MCP tool set.
+
+| Action        | Scope                       | Description                                      |
+| :------------ | :-------------------------- | :----------------------------------------------- |
+| `search`      | `obsidian:read`             | Bounded global search with snippets.             |
+| `fetch`       | `obsidian:read`             | Fetch bounded note content by vault path.        |
+| `task_query`  | `obsidian:read`             | Tasks-plugin-aware task query.                   |
+| `latest_note` | `obsidian:read`             | Fetch the latest modified note, optionally scoped by path. |
+| `create_task` | `obsidian:write`            | Create a Tasks-plugin-compatible task.           |
+| `update_task` | `obsidian:write`            | Update an existing task.                         |
+| `append_note` | `obsidian:write`            | Append or prepend note content.                  |
+| `overwrite_note` | `obsidian:dangerous-write` | Whole-note overwrite for explicitly trusted clients. |
+
+Writes are appended to the local JSONL audit log at
+`CHATGPT_FACADE_AUDIT_PATH`. The audit entry records action, client id, scopes,
+target path, mode, result path, status, and a capped input summary; it does not
+store raw ChatGPT transcripts or full note bodies. Operators can inspect recent
+entries with:
+
+```bash
+curl "http://127.0.0.1:3020/audit/recent?admin_secret=$CHATGPT_FACADE_ADMIN_SECRET"
+```
+
+### Legacy In-Process Layer
+
+`CHATGPT_LAYER_ENABLED=true` still enables the older in-process
+manifest/actions layer on the main HTTP transport for local/dev compatibility.
+That layer uses `MCP_AUTH_KEY` query-string auth and exposes broader actions
+including page overwrite. Do not use it as the recommended hosted ChatGPT
+connector path.
 
 ## Project Structure
 
