@@ -665,7 +665,7 @@ async function handleMcpRequest(options: {
       const mcpServer = createFacadeMcpServer(
         options.vaultManager,
         options.context,
-        scopesForClient(options.scopes, auth.scopes),
+        options.scopes,
         options.store,
         auth,
       );
@@ -718,7 +718,16 @@ function createFacadeMcpServer(
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: false,
-    securitySchemes: [{ type: "noauth" }],
+  };
+  const writeToolAnnotations = {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  };
+  const dangerousWriteToolAnnotations = {
+    ...writeToolAnnotations,
+    destructiveHint: true,
   };
 
   if (enabledScopes.has(OBSIDIAN_READ_SCOPE)) {
@@ -861,6 +870,12 @@ function createFacadeMcpServer(
     );
   }
 
+  applyFacadeToolMetadata(server, {
+    readOnly: readOnlyToolAnnotations,
+    write: writeToolAnnotations,
+    dangerousWrite: dangerousWriteToolAnnotations,
+  });
+
   return server;
 }
 
@@ -876,6 +891,34 @@ async function callAuditedFacadeTool(
     operation: `MCP_${request.action}`,
   });
   const requiredScope = ACTION_SCOPES[request.action];
+  try {
+    requireScope(auth.scopeString, requiredScope);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    store.appendAudit({
+      action: request.action,
+      clientId: auth.clientId,
+      scopes: auth.scopes,
+      vaultId: request.vault,
+      targetPath: targetPathFor(request),
+      mode: modeFor(request),
+      status: "rejected",
+      inputSummary: summarizeActionInput(request),
+      correlationId: typeof context.correlationId === "string" ? context.correlationId : randomUUID(),
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: message,
+        },
+      ],
+      isError: true,
+      _meta: {
+        "mcp/www_authenticate": `Bearer realm="obsidian-chatgpt", scope="${requiredScope}", error="insufficient_scope", error_description="${escapeHeaderValue(message)}"`,
+      },
+    };
+  }
   const result = await executeFacadeAction(request, vaultManager, context);
   if (requiredScope !== OBSIDIAN_READ_SCOPE) {
     store.appendAudit({
@@ -2494,9 +2537,65 @@ function getConfiguredScopes(): string[] {
     : [OBSIDIAN_READ_SCOPE, ...configured];
 }
 
-function scopesForClient(configuredScopes: string[], clientScopes: string[]): string[] {
-  const configured = new Set(configuredScopes);
-  return clientScopes.filter((scope) => configured.has(scope));
+function applyFacadeToolMetadata(
+  server: McpServer,
+  annotations: {
+    readOnly: Record<string, unknown>;
+    write: Record<string, unknown>;
+    dangerousWrite: Record<string, unknown>;
+  },
+): void {
+  const registeredTools = (server as unknown as {
+    _registeredTools?: Record<string, {
+      update(updates: {
+        annotations?: Record<string, unknown>;
+        _meta?: Record<string, unknown>;
+      }): void;
+    }>;
+  })._registeredTools;
+  if (!registeredTools) {
+    return;
+  }
+
+  for (const [toolName, requiredScope] of Object.entries(ACTION_SCOPES)) {
+    const tool = registeredTools[toolName];
+    if (!tool) {
+      continue;
+    }
+    tool.update({
+      annotations: annotationsForTool(toolName, requiredScope, annotations),
+      _meta: {
+        securitySchemes: [
+          {
+            type: "oauth2",
+            scopes: [requiredScope],
+          },
+        ],
+      },
+    });
+  }
+}
+
+function annotationsForTool(
+  toolName: string,
+  requiredScope: string,
+  annotations: {
+    readOnly: Record<string, unknown>;
+    write: Record<string, unknown>;
+    dangerousWrite: Record<string, unknown>;
+  },
+): Record<string, unknown> {
+  if (requiredScope === OBSIDIAN_READ_SCOPE) {
+    return annotations.readOnly;
+  }
+  if (requiredScope === OBSIDIAN_DANGEROUS_WRITE_SCOPE || toolName === "overwrite_note") {
+    return annotations.dangerousWrite;
+  }
+  return annotations.write;
+}
+
+function escapeHeaderValue(value: string): string {
+  return value.replace(/[\r\n"\\]/g, " ").trim();
 }
 
 function actionDescriptorsForScopes(scopes: string[]): typeof ACTION_DESCRIPTORS {
