@@ -46,12 +46,31 @@ import {
 } from "./facadeAuth.js";
 
 const CHATGPT_BROWSER_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"];
+const DEFAULT_DAILY_NOTE_DIRECTORY = "01-Daily-Notes";
+const DEFAULT_DAILY_NOTE_TEMPLATE_PATH = "01-Daily-Notes/Daily Note Template.md";
 
 const AppendNoteParametersSchema = z.object({
   filePath: z.string().min(1, "filePath is required"),
   content: z.string().min(1, "content cannot be empty"),
   mode: z.enum(["append", "prepend"]).default("append"),
   createIfMissing: z.boolean().default(true),
+});
+
+const CreateNoteParametersSchema = z.object({
+  filePath: z.string().min(1, "filePath is required"),
+  content: z.string().min(1, "content cannot be empty"),
+  ifExists: z.enum(["error", "return", "append"]).default("error"),
+  appendSeparator: z.string().default("\n\n"),
+});
+
+const CreateDailyNoteParametersSchema = z.object({
+  date: z.string().optional(),
+  directory: z.string().default(DEFAULT_DAILY_NOTE_DIRECTORY),
+  templateFilePath: z.string().default(DEFAULT_DAILY_NOTE_TEMPLATE_PATH),
+  useTemplate: z.boolean().default(true),
+  content: z.string().optional(),
+  ifExists: z.enum(["error", "return", "append"]).default("return"),
+  appendSeparator: z.string().default("\n\n"),
 });
 
 const ChatGptFacadeActionSchema = z.discriminatedUnion("action", [
@@ -103,6 +122,16 @@ const ChatGptFacadeActionSchema = z.discriminatedUnion("action", [
     parameters: AppendNoteParametersSchema,
   }),
   z.object({
+    action: z.literal("create_note"),
+    vault: z.string().optional(),
+    parameters: CreateNoteParametersSchema,
+  }),
+  z.object({
+    action: z.literal("create_daily_note"),
+    vault: z.string().optional(),
+    parameters: CreateDailyNoteParametersSchema,
+  }),
+  z.object({
     action: z.literal("overwrite_note"),
     vault: z.string().optional(),
     parameters: z.object({
@@ -134,6 +163,8 @@ const ACTION_SCOPES: Record<ChatGptFacadeActionRequest["action"], string> = {
   create_task: OBSIDIAN_WRITE_SCOPE,
   update_task: OBSIDIAN_WRITE_SCOPE,
   append_note: OBSIDIAN_WRITE_SCOPE,
+  create_note: OBSIDIAN_WRITE_SCOPE,
+  create_daily_note: OBSIDIAN_WRITE_SCOPE,
   overwrite_note: OBSIDIAN_DANGEROUS_WRITE_SCOPE,
 };
 
@@ -172,6 +203,16 @@ const ACTION_DESCRIPTORS = [
     action: "append_note",
     scope: OBSIDIAN_WRITE_SCOPE,
     summary: "Append or prepend note content. Overwrite is not allowed here.",
+  },
+  {
+    action: "create_note",
+    scope: OBSIDIAN_WRITE_SCOPE,
+    summary: "Create a new note without overwriting existing content.",
+  },
+  {
+    action: "create_daily_note",
+    scope: OBSIDIAN_WRITE_SCOPE,
+    summary: "Create today's or a specified daily note from the vault template.",
   },
   {
     action: "overwrite_note",
@@ -778,6 +819,28 @@ function createFacadeMcpServer(
         parameters: params,
       }, vaultManager, parentContext, store, auth),
     );
+
+    server.tool(
+      "create_note",
+      "Create a new note by vault-relative path. Existing notes are not overwritten.",
+      CreateNoteParametersSchema.extend({ vault: z.string().optional() }).shape,
+      async (params) => callAuditedFacadeTool({
+        action: "create_note",
+        vault: params.vault,
+        parameters: params,
+      }, vaultManager, parentContext, store, auth),
+    );
+
+    server.tool(
+      "create_daily_note",
+      "Create today's or a specified daily note from the configured daily-note template.",
+      CreateDailyNoteParametersSchema.extend({ vault: z.string().optional() }).shape,
+      async (params) => callAuditedFacadeTool({
+        action: "create_daily_note",
+        vault: params.vault,
+        parameters: params,
+      }, vaultManager, parentContext, store, auth),
+    );
   }
 
   if (enabledScopes.has(OBSIDIAN_DANGEROUS_WRITE_SCOPE)) {
@@ -959,6 +1022,40 @@ async function executeFacadeAction(
       }
       return { vaultId, payload, resultPath: request.parameters.filePath };
     }
+    case "create_note": {
+      let payload: Record<string, unknown>;
+      try {
+        payload = await createNote(
+          request.parameters,
+          obsidianService,
+          context,
+        );
+      } catch (error) {
+        payload = await filesystemCreateNote(vaultId, request.parameters, context, error);
+      }
+      return {
+        vaultId,
+        payload,
+        resultPath: String(payload.filePath || request.parameters.filePath),
+      };
+    }
+    case "create_daily_note": {
+      let payload: Record<string, unknown>;
+      try {
+        payload = await createDailyNote(
+          request.parameters,
+          obsidianService,
+          context,
+        );
+      } catch (error) {
+        payload = await filesystemCreateDailyNote(vaultId, request.parameters, context, error);
+      }
+      return {
+        vaultId,
+        payload,
+        resultPath: String(payload.filePath || dailyNotePath(request.parameters)),
+      };
+    }
     case "overwrite_note": {
       try {
         if (!request.parameters.createIfMissing) {
@@ -987,6 +1084,13 @@ async function executeFacadeAction(
       };
     }
   }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof McpError &&
+    error.code === BaseErrorCode.NOT_FOUND
+  );
 }
 
 async function appendOrPrependNote(
@@ -1047,6 +1151,121 @@ async function appendOrPrependNote(
     mode: params.mode,
     created,
     contentLength: params.content.length,
+  };
+}
+
+async function createNote(
+  params: z.infer<typeof CreateNoteParametersSchema>,
+  obsidianService: any,
+  context: RequestContext,
+): Promise<Record<string, unknown>> {
+  const filePath = safeVaultRelativePath(params.filePath);
+  try {
+    await obsidianService.getFileContent(filePath, "markdown", context);
+    if (params.ifExists === "return") {
+      return {
+        filePath,
+        mode: "return",
+        created: false,
+        existing: true,
+        contentLength: 0,
+      };
+    }
+    if (params.ifExists === "append") {
+      await obsidianService.appendFileContent(
+        filePath,
+        `${params.appendSeparator}${params.content}`,
+        context,
+      );
+      return {
+        filePath,
+        mode: "append",
+        created: false,
+        existing: true,
+        appended: true,
+        contentLength: params.content.length,
+      };
+    }
+    throw new McpError(BaseErrorCode.VALIDATION_ERROR, `Note already exists: ${filePath}`);
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+
+  await obsidianService.updateFileContent(filePath, ensureTrailingNewline(params.content), context);
+  return {
+    filePath,
+    mode: "create",
+    created: true,
+    existing: false,
+    contentLength: params.content.length,
+  };
+}
+
+async function createDailyNote(
+  params: z.infer<typeof CreateDailyNoteParametersSchema>,
+  obsidianService: any,
+  context: RequestContext,
+): Promise<Record<string, unknown>> {
+  const note = await buildDailyNoteCreateParams(params, async (templatePath) => {
+    try {
+      const template = await obsidianService.getFileContent(templatePath, "markdown", context);
+      return typeof template === "string" ? template : JSON.stringify(template, null, 2);
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+  });
+
+  try {
+    await obsidianService.getFileContent(note.filePath, "markdown", context);
+    if (note.ifExists === "return" || !note.existsAppendContent) {
+      return {
+        filePath: note.filePath,
+        mode: "return",
+        created: false,
+        existing: true,
+        date: note.date,
+        templateFilePath: note.templateFilePath,
+        contentLength: 0,
+      };
+    }
+    if (note.ifExists === "append") {
+      await obsidianService.appendFileContent(
+        note.filePath,
+        `${note.appendSeparator}${note.existsAppendContent}`,
+        context,
+      );
+      return {
+        filePath: note.filePath,
+        mode: "append",
+        created: false,
+        existing: true,
+        appended: true,
+        date: note.date,
+        templateFilePath: note.templateFilePath,
+        contentLength: note.existsAppendContent.length,
+      };
+    }
+    throw new McpError(BaseErrorCode.VALIDATION_ERROR, `Daily note already exists: ${note.filePath}`);
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+
+  await obsidianService.updateFileContent(note.filePath, note.content, context);
+  return {
+    filePath: note.filePath,
+    mode: "create",
+    created: true,
+    existing: false,
+    date: note.date,
+    templateFilePath: note.templateFilePath,
+    contentLength: note.content.length,
   };
 }
 
@@ -1255,6 +1474,251 @@ async function filesystemAppendOrPrependNote(
     created,
     contentLength: params.content.length,
   };
+}
+
+async function filesystemCreateNote(
+  vaultId: string,
+  params: z.infer<typeof CreateNoteParametersSchema>,
+  context: RequestContext,
+  originalError?: unknown,
+): Promise<Record<string, unknown>> {
+  const filePath = safeVaultRelativePath(params.filePath);
+  logger.warning("Using filesystem create note fallback for ChatGPT facade", {
+    ...context,
+    vaultId,
+    filePath,
+    ifExists: params.ifExists,
+    originalError: originalError ? fallbackCause(originalError) : undefined,
+  });
+
+  try {
+    const current = await readFilesystemNote(vaultId, filePath);
+    if (params.ifExists === "return") {
+      return {
+        source: "filesystem-fallback",
+        filePath: current.relativePath,
+        mode: "return",
+        created: false,
+        existing: true,
+        contentLength: 0,
+      };
+    }
+    if (params.ifExists === "append") {
+      const nextContent = `${current.content.replace(/\n*$/, "")}${params.appendSeparator}${params.content}\n`;
+      const { relativePath } = await writeFilesystemNote(vaultId, filePath, nextContent);
+      return {
+        source: "filesystem-fallback",
+        filePath: relativePath,
+        mode: "append",
+        created: false,
+        existing: true,
+        appended: true,
+        contentLength: params.content.length,
+      };
+    }
+    throw new McpError(BaseErrorCode.VALIDATION_ERROR, `Note already exists: ${filePath}`);
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+
+  const { relativePath } = await writeFilesystemNote(vaultId, filePath, ensureTrailingNewline(params.content));
+  return {
+    source: "filesystem-fallback",
+    filePath: relativePath,
+    mode: "create",
+    created: true,
+    existing: false,
+    contentLength: params.content.length,
+  };
+}
+
+async function filesystemCreateDailyNote(
+  vaultId: string,
+  params: z.infer<typeof CreateDailyNoteParametersSchema>,
+  context: RequestContext,
+  originalError?: unknown,
+): Promise<Record<string, unknown>> {
+  logger.warning("Using filesystem create daily note fallback for ChatGPT facade", {
+    ...context,
+    vaultId,
+    date: params.date,
+    directory: params.directory,
+    originalError: originalError ? fallbackCause(originalError) : undefined,
+  });
+  const note = await buildDailyNoteCreateParams(params, async (templatePath) => {
+    try {
+      return (await readFilesystemNote(vaultId, templatePath)).content;
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+  });
+  try {
+    const current = await readFilesystemNote(vaultId, note.filePath);
+    if (note.ifExists === "return" || !note.existsAppendContent) {
+      return {
+        source: "filesystem-fallback",
+        filePath: current.relativePath,
+        mode: "return",
+        created: false,
+        existing: true,
+        date: note.date,
+        templateFilePath: note.templateFilePath,
+        contentLength: 0,
+      };
+    }
+    if (note.ifExists === "append") {
+      const nextContent = `${current.content.replace(/\n*$/, "")}${note.appendSeparator}${note.existsAppendContent}`;
+      const { relativePath } = await writeFilesystemNote(vaultId, note.filePath, ensureTrailingNewline(nextContent));
+      return {
+        source: "filesystem-fallback",
+        filePath: relativePath,
+        mode: "append",
+        created: false,
+        existing: true,
+        appended: true,
+        date: note.date,
+        templateFilePath: note.templateFilePath,
+        contentLength: note.existsAppendContent.length,
+      };
+    }
+    throw new McpError(BaseErrorCode.VALIDATION_ERROR, `Daily note already exists: ${note.filePath}`);
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+
+  const { relativePath } = await writeFilesystemNote(vaultId, note.filePath, note.content);
+  return {
+    source: "filesystem-fallback",
+    filePath: relativePath,
+    mode: "create",
+    created: true,
+    existing: false,
+    date: note.date,
+    templateFilePath: note.templateFilePath,
+    contentLength: note.content.length,
+  };
+}
+
+interface DailyNoteCreateParams {
+  date: string;
+  filePath: string;
+  templateFilePath: string;
+  content: string;
+  existsAppendContent?: string;
+  ifExists: "error" | "return" | "append";
+  appendSeparator: string;
+}
+
+async function buildDailyNoteCreateParams(
+  params: z.infer<typeof CreateDailyNoteParametersSchema>,
+  loadTemplate: (templatePath: string) => Promise<string | undefined>,
+): Promise<DailyNoteCreateParams> {
+  const date = normalizeDailyNoteDate(params.date);
+  const filePath = dailyNotePath({ ...params, date });
+  const templateFilePath = safeVaultRelativePath(params.templateFilePath);
+  const template = params.useTemplate ? await loadTemplate(templateFilePath) : undefined;
+  return {
+    date,
+    filePath,
+    templateFilePath,
+    content: renderDailyNoteContent({
+      date,
+      template,
+      content: params.content,
+    }),
+    existsAppendContent: params.content ? ensureTrailingNewline(params.content) : undefined,
+    ifExists: params.ifExists,
+    appendSeparator: params.appendSeparator,
+  };
+}
+
+function normalizeDailyNoteDate(input?: string): string {
+  if (!input) {
+    return localDateString(new Date());
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    return input;
+  }
+  return formatFacadeDate(input);
+}
+
+function localDateString(date: Date): string {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function dailyNotePath(params: Pick<z.infer<typeof CreateDailyNoteParametersSchema>, "directory" | "date">): string {
+  const directory = safeVaultRelativePath(params.directory).replace(/\/+$/, "");
+  const date = normalizeDailyNoteDate(params.date);
+  return `${directory}/${date}.md`;
+}
+
+function renderDailyNoteContent(input: {
+  date: string;
+  template?: string;
+  content?: string;
+}): string {
+  const renderedTemplate = input.template
+    ? renderDailyTemplateVariables(input.template, input.date)
+    : defaultDailyNoteContent(input.date);
+  const parts = [renderedTemplate, input.content]
+    .filter((part): part is string => Boolean(part?.trim()))
+    .map((part) => part.replace(/\n*$/, ""));
+  return ensureTrailingNewline(parts.join("\n\n"));
+}
+
+function renderDailyTemplateVariables(template: string, date: string): string {
+  const parsed = dateParts(date);
+  return template
+    .replace(/\{\{date(?::YYYY-MM-DD)?\}\}/g, date)
+    .replace(/\{\{title\}\}/g, date)
+    .replace(/\{\{year\}\}/g, String(parsed.year))
+    .replace(/\{\{month\}\}/g, String(parsed.month).padStart(2, "0"))
+    .replace(/\{\{day\}\}/g, String(parsed.day).padStart(2, "0"));
+}
+
+function dateParts(date: string): { year: number; month: number; day: number } {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!match) {
+    throw new McpError(BaseErrorCode.VALIDATION_ERROR, `Invalid date format: ${date}`);
+  }
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+  };
+}
+
+function defaultDailyNoteContent(date: string): string {
+  return `# ${date}
+
+## Today's Focus
+**Primary Context**:
+**Top 3 priorities**:
+1.
+2.
+3.
+
+## Notes
+
+## Tasks
+
+## Reflection
+`;
+}
+
+function ensureTrailingNewline(content: string): string {
+  return content.endsWith("\n") ? content : `${content}\n`;
 }
 
 async function filesystemOverwriteNote(
@@ -1953,8 +2417,12 @@ function summarizeActionInput(request: ChatGptFacadeActionRequest): string {
   return summarizeInput(request.parameters as Record<string, unknown>, [
     "query",
     "filePath",
+    "date",
+    "directory",
+    "templateFilePath",
     "text",
     "mode",
+    "ifExists",
     "operation",
     "lineNumber",
     "taskText",
@@ -1965,12 +2433,18 @@ function targetPathFor(request: ChatGptFacadeActionRequest): string | undefined 
   if ("filePath" in request.parameters) {
     return request.parameters.filePath;
   }
+  if (request.action === "create_daily_note") {
+    return dailyNotePath(request.parameters);
+  }
   return undefined;
 }
 
 function modeFor(request: ChatGptFacadeActionRequest): string | undefined {
   if (request.action === "append_note") {
     return request.parameters.mode;
+  }
+  if (request.action === "create_note" || request.action === "create_daily_note") {
+    return request.parameters.ifExists === "append" ? "append-or-create" : "create";
   }
   if (request.action === "overwrite_note") {
     return "overwrite";

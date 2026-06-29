@@ -458,8 +458,8 @@ tokens by resource, expiry, and scope before executing actions.
 
 Scopes:
 
-- `obsidian:read`: `search`, `fetch`, `task_query`
-- `obsidian:write`: `create_task`, `update_task`, `append_note`
+- `obsidian:read`: `search`, `fetch`, `task_query`, `latest_note`
+- `obsidian:write`: `create_task`, `update_task`, `append_note`, `create_note`, `create_daily_note`
 - `obsidian:dangerous-write`: `overwrite_note`
 
 Read-only connector setup is the default and is supported by granting only
@@ -482,6 +482,8 @@ smaller than the full local MCP tool set.
 | `create_task` | `obsidian:write`            | Create a Tasks-plugin-compatible task.           |
 | `update_task` | `obsidian:write`            | Update an existing task.                         |
 | `append_note` | `obsidian:write`            | Append or prepend note content.                  |
+| `create_note` | `obsidian:write`            | Create a note without overwriting existing content. |
+| `create_daily_note` | `obsidian:write`       | Create today's or a specified daily note from the daily-note template. |
 | `overwrite_note` | `obsidian:dangerous-write` | Whole-note overwrite for explicitly trusted clients. |
 
 Writes are appended to the local JSONL audit log at
