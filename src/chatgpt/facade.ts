@@ -45,6 +45,8 @@ import {
   summarizeInput,
 } from "./facadeAuth.js";
 
+const CHATGPT_BROWSER_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"];
+
 const AppendNoteParametersSchema = z.object({
   filePath: z.string().min(1, "filePath is required"),
   content: z.string().min(1, "content cannot be empty"),
@@ -230,6 +232,12 @@ export async function startChatGptFacade(
         return;
       }
 
+      if (url.pathname === "/health" && req.method === "HEAD") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
       if (url.pathname === "/health" && req.method === "GET") {
         sendJson(res, 200, {
           status: "ok",
@@ -280,6 +288,12 @@ export async function startChatGptFacade(
         return;
       }
 
+      if (url.pathname === "/register" && req.method === "HEAD") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
       if (url.pathname === "/register" && req.method === "POST") {
         const payload = await parseJsonBody(req);
         const clientId =
@@ -299,6 +313,12 @@ export async function startChatGptFacade(
         return;
       }
 
+      if (url.pathname === "/authorize" && req.method === "HEAD") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
       if (url.pathname === "/authorize" && req.method === "GET") {
         const payload = Object.fromEntries(url.searchParams.entries());
         const normalized = validateAuthorizePayload(payload, publicUrl, scopes);
@@ -306,22 +326,35 @@ export async function startChatGptFacade(
           sendText(res, 503, "ChatGPT facade admin secret is not configured.");
           return;
         }
-        sendText(res, 200, renderAuthorizeForm(normalized));
+        sendText(res, 200, renderAuthorizeForm(normalized, publicUrl));
         return;
       }
 
       if (url.pathname === "/authorize" && req.method === "POST") {
         const payload = await parseFormBody(req);
         const adminSecret = payload.admin_secret || "";
-        if (
-          !config.chatgptFacadeAdminSecret ||
-          adminSecret !== config.chatgptFacadeAdminSecret
-        ) {
+        delete payload.admin_secret;
+        const normalized = validateAuthorizePayload(payload, publicUrl, scopes);
+        if (!config.chatgptFacadeAdminSecret) {
+          sendText(res, 503, "ChatGPT facade admin secret is not configured.");
+          return;
+        }
+        if (!adminSecret) {
+          sendText(
+            res,
+            200,
+            renderAuthorizeForm(
+              normalized,
+              publicUrl,
+              "Enter the admin secret to approve access.",
+            ),
+          );
+          return;
+        }
+        if (adminSecret !== config.chatgptFacadeAdminSecret) {
           sendText(res, 401, "Invalid admin secret.");
           return;
         }
-        delete payload.admin_secret;
-        const normalized = validateAuthorizePayload(payload, publicUrl, scopes);
         const code = store.createAuthorizationCode({
           clientId: normalized.client_id,
           redirectUri: normalized.redirect_uri,
@@ -335,6 +368,12 @@ export async function startChatGptFacade(
           redirect.searchParams.set("state", normalized.state);
         }
         res.writeHead(302, { Location: redirect.toString() });
+        res.end();
+        return;
+      }
+
+      if (url.pathname === "/token" && req.method === "HEAD") {
+        res.writeHead(200);
         res.end();
         return;
       }
@@ -1885,17 +1924,23 @@ function validateAuthorizePayload(
   };
 }
 
-function renderAuthorizeForm(payload: Record<string, string>): string {
+function renderAuthorizeForm(
+  payload: Record<string, string>,
+  publicUrl: string,
+  message?: string,
+): string {
   const hidden = Object.entries(payload)
     .map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`)
     .join("\n");
+  const messageHtml = message ? `<p>${escapeHtml(message)}</p>` : "";
   return `<!doctype html>
 <html>
   <head><title>Obsidian ChatGPT Authorization</title></head>
   <body>
     <h1>Obsidian ChatGPT Authorization</h1>
     <p>Approve scoped access to the Obsidian ChatGPT facade.</p>
-    <form method="post" action="/authorize">
+    ${messageHtml}
+    <form method="post" action="${escapeHtml(publicUrl)}/authorize">
       ${hidden}
       <label>Admin secret <input name="admin_secret" type="password" autofocus></label>
       <button type="submit">Approve</button>
@@ -1997,9 +2042,12 @@ function setCorsHeaders(
   res: ServerResponse,
   publicUrl: string,
 ): void {
-  const allowedOrigins = config.chatgptFacadeAllowedOrigins?.length
-    ? config.chatgptFacadeAllowedOrigins
-    : [publicUrl];
+  const allowedOrigins = Array.from(new Set([
+    ...(config.chatgptFacadeAllowedOrigins?.length
+      ? config.chatgptFacadeAllowedOrigins
+      : [publicUrl]),
+    ...CHATGPT_BROWSER_ORIGINS,
+  ]));
   const requestOrigin = req.headers.origin;
   const origin = requestOrigin && allowedOrigins.includes(requestOrigin)
     ? requestOrigin
@@ -2007,7 +2055,8 @@ function setCorsHeaders(
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Protocol-Version, mcp-session-id, Accept");
+  res.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Session-ID");
 }
 
 function parseJsonBody(req: IncomingMessage): Promise<any> {
