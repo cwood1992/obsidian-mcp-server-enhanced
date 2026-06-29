@@ -293,6 +293,83 @@ def dirty_checkout_payload(root: Path, task_id: str, entries: list[dict]):
     }
 
 
+def untracked_scope_blockers(entries: list[dict], scope: list[str]) -> list[dict]:
+    if not scope:
+        return [
+            {
+                "path": entry["path"],
+                "code": entry["code"],
+                "reason": "task scope is unknown",
+            }
+            for entry in entries
+            if entry["code"] == "??"
+        ]
+    blockers = []
+    for entry in entries:
+        if entry["code"] != "??":
+            continue
+        for item in scope:
+            if paths_overlap(entry["path"], item):
+                blockers.append(
+                    {
+                        "path": entry["path"],
+                        "code": entry["code"],
+                        "scope": item,
+                        "reason": "untracked primary file overlaps task scope",
+                    }
+                )
+                break
+    return blockers
+
+
+def untracked_scope_payload(root: Path, task_id: str, scope: list[str], blockers: list[dict]):
+    recommendations = [
+        "commit the untracked source files before preparing the task worktree",
+        "or park/remove them from the primary checkout before preparing the task",
+        f"then rerun: make agent-task-prepare TASK={task_id} SCOPE=\"{' '.join(scope)}\"",
+    ]
+    return {
+        "schema_version": 1,
+        "command": "agent-task-prepare",
+        "result": "blocked",
+        "repo": str(root),
+        "blockers": [
+            "Dirty primary baseline contains untracked files inside the task scope; a new task worktree would not contain those files."
+        ],
+        "scope": scope,
+        "untracked_scope_files": blockers,
+        "recommendations": recommendations,
+        "exit_code": 1,
+    }
+
+
+def render_untracked_scope_block(payload: dict):
+    lines = [
+        "Dirty primary baseline contains untracked files inside the task scope.",
+        "A new task worktree starts from HEAD and would not contain those files.",
+        "",
+        "Untracked scoped files:",
+    ]
+    lines.extend(
+        f" - {item['path']} ({item.get('reason')}; scope={item.get('scope', 'unknown')})"
+        for item in payload["untracked_scope_files"]
+    )
+    lines.extend(["", "Next safe commands:"])
+    lines.extend(f" - {command}" for command in payload["recommendations"])
+    return "\n".join(lines)
+
+
+def ensure_dirty_baseline_scope_is_materialized(root: Path, task_id: str, scope: list[str], entries: list[dict], json_output: bool):
+    blockers = untracked_scope_blockers(entries, scope)
+    if not blockers:
+        return
+    payload = untracked_scope_payload(root, task_id, scope, blockers)
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        raise SystemExit(1)
+    raise SystemExit(render_untracked_scope_block(payload))
+
+
 def render_dirty_checkout(payload: dict):
     lines = [
         "Main checkout must be clean before preparing a write-capable task worktree.",
@@ -812,6 +889,8 @@ def main():
     ensure_task_gitignore(root)
     dirty_primary_baseline = args.dirty_primary_baseline or args.allow_dirty
     main_status = ensure_clean_main(root, args.task, dirty_primary_baseline, args.json)
+    if main_status and dirty_primary_baseline:
+        ensure_dirty_baseline_scope_is_materialized(root, args.task, scope, main_status, args.json)
     primary_baseline = checkout_status_snapshot(root, created_at, main_status) if main_status and dirty_primary_baseline else None
     existing_tasks = active_tasks(root)
     warnings = overlap_warnings(scope, existing_tasks)

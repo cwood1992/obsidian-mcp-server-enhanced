@@ -1,7 +1,7 @@
 {
   "installed_at": "2026-06-19T00:57:43+00:00",
-  "kit_version": "0.6.29",
-  "last_updated_at": "2026-06-28T22:09:17+00:00",
+  "kit_version": "0.6.34",
+  "last_updated_at": "2026-06-29T11:33:15+00:00",
   "preset": "agentic",
   "profile_config_schema_version": 1,
   "profiles": [
@@ -30,7 +30,7 @@
     ],
     "snapshot_sha256": "979a2eb202fb391760ed8ce617b956ec5ba87a2f1c948622e0591f52b791235f",
     "source_prompt_root": "workflows/prompts",
-    "source_ref": "90f8f60fa0e85785d2f9a20089b0431e526464e7",
+    "source_ref": "07e90cf8855d72fe7ff8b9c7c697f55d93faaa2c",
     "source_url": "https://github.com/BoweyLou/repo-contract-kit",
     "vendored_at": "2026-06-18",
     "version": "0.4.60"
@@ -38,13 +38,13 @@
   "runtime_adapters": [],
   "schema_version": 1,
   "source_commits": {
-    "repo-contract-kit": "90f8f60fa0e85785d2f9a20089b0431e526464e7",
-    "workflow-source": "90f8f60fa0e85785d2f9a20089b0431e526464e7"
+    "repo-contract-kit": "07e90cf8855d72fe7ff8b9c7c697f55d93faaa2c",
+    "workflow-source": "07e90cf8855d72fe7ff8b9c7c697f55d93faaa2c"
   },
   "source_components": {
     "repo-contract-kit": {
-      "source_ref": "90f8f60fa0e85785d2f9a20089b0431e526464e7",
-      "version": "0.6.29"
+      "source_ref": "07e90cf8855d72fe7ff8b9c7c697f55d93faaa2c",
+      "version": "0.6.34"
     },
     "workflow-source": {
       "generated_adapter": "templates/profiles/*/files/.codex/prompts",
@@ -65,12 +65,12 @@
       ],
       "snapshot_sha256": "979a2eb202fb391760ed8ce617b956ec5ba87a2f1c948622e0591f52b791235f",
       "source_prompt_root": "workflows/prompts",
-      "source_ref": "90f8f60fa0e85785d2f9a20089b0431e526464e7",
+      "source_ref": "07e90cf8855d72fe7ff8b9c7c697f55d93faaa2c",
       "source_url": "https://github.com/BoweyLou/repo-contract-kit",
       "vendored_at": "2026-06-18",
       "version": "0.4.60"
     }
   },
-  "source_ref": "90f8f60fa0e85785d2f9a20089b0431e526464e7",
-  "source_version": "0.6.29"
+  "source_ref": "07e90cf8855d72fe7ff8b9c7c697f55d93faaa2c",
+  "source_version": "0.6.34"
 }

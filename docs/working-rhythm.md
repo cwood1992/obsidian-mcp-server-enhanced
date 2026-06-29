@@ -18,6 +18,7 @@ kit status
 kit update --dry-run
 kit update
 kit doctor
+kit closeout-plan
 ```
 
 `kit setup` is the target enrollment command. It is intentionally a normal CLI
@@ -128,6 +129,7 @@ make agent-task-heartbeat TASK=<id>
 make agent-task-finalize TASK=<id> TASK_RECEIPT=<path>
 make agent-task-finish TASK=<id> TASK_RECEIPT=<path>
 make agent-task-closeout
+kit closeout-plan --json
 make agent-verify
 ```
 
@@ -140,6 +142,12 @@ finalizer, self-heal, and closeout state with attribution and latest receipt
 provenance, then recommends deterministic next commands such as
 `agent-self-heal`, `agent-task-status`, `agent-task-ready`,
 `agent-task-finalize`, `agent-task-closeout`, or `agent-automation-handoff`.
+Run `kit closeout-plan --json` after validation and before a final handoff. If
+it reports `can_claim_done=false`, do not claim the work is done; report the
+`completion_state`, `claim_blockers`, and `next_action`.
+Use `git_worktree_state` for real Git dirt and `kit_managed_state` for kit
+template or proposal review; managed proposals are not Git worktree dirt, but
+they still need an accept, reject, or receipt decision before closeout.
 `agent-branch-readiness` sits after those local task gates when a whole branch
 or PR needs one JSON answer before a human updates PR state or hosted branch
 governance.
@@ -166,12 +174,15 @@ If the main checkout is dirty, the prepare blocker lists dirty
 entries and safe recovery commands; set `TASK_PREPARE_JSON=1` for machine output
 or `DIRTY_PRIMARY_BASELINE=1` only when preserving existing dirt is intentional.
 That mode records the primary checkout's dirty entries, counts, HEAD, changed
-files, and state hash in task metadata and receipt scaffolds. `ALLOW_DIRTY=1`
-remains a legacy alias for the same baseline mode. `agent-task-ready` then
-checks actual changed files against declared scope, reports goal-check status,
-validates strict receipt/docs-impact evidence, verifies base branch freshness,
-blocks primary-checkout drift after a dirty baseline, and blocks overlap with
-other in-progress tasks before PR update or merge handoff. The worker edits in the
+files, and state hash in task metadata and receipt scaffolds. Because the task
+worktree starts from HEAD, prepare blocks dirty-baseline runs when untracked
+files overlap the declared task scope; commit or park those files first.
+`ALLOW_DIRTY=1` remains a legacy alias for the same baseline mode.
+`agent-task-ready` then checks actual changed files against declared scope,
+reports goal-check status, validates strict receipt/docs-impact evidence,
+verifies base branch freshness, blocks primary-checkout drift after a dirty
+baseline, and blocks overlap with other in-progress tasks before PR update or
+merge handoff. The worker edits in the
 task worktree, refreshes the
 lease with `agent-task-heartbeat` during long work, checks `agent-task-status`
 before handoff, then captures validation evidence and closes the task with
@@ -236,7 +247,13 @@ For kit maintenance:
 kit status
 kit update --dry-run
 kit update
+kit target import --root /path/to/repos --dry-run
+kit target list --json
+kit update --all --dry-run
+kit worktree audit --root /path/to/repos --json
+kit worktree prune --root /path/to/repos --dry-run
 kit doctor
+kit closeout-plan
 make kit-explain
 ```
 
@@ -245,6 +262,13 @@ Use `kit start` for opportunistic local-safe kit maintenance and
 updates stay explicit through `kit update --global`. Update plans and reports
 include a `read_next` list; read those docs before merging proposed replacements
 from `.doc-contract-kit/updates/`.
+Successful `kit setup` and `kit update` runs register enrolled targets for
+`kit update --all --dry-run`. Use `kit target import --root <root> --dry-run`
+to seed existing primary repos from install receipts; agent-worktree and archive
+paths are excluded by default. Batch apply needs `--apply` and skips dirty,
+missing, or no-longer-enrolled targets. Use `kit worktree audit` and
+`kit worktree prune --dry-run` for disposable task worktrees, separately from
+primary repo updates.
 Use `docs/upgrade-flow.md` for the full safe update sequence, including
 metadata-only migration and conflict review. Kit updates keep root `AGENTS.md`
 in place and preserve customized managed files.

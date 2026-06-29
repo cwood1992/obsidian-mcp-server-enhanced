@@ -24,8 +24,21 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 CLI_ENTRYPOINT = ROOT / "scripts" / "repo_contract_kit.py"
 STATE_APP_DIR = "repo-contract-kit"
+TARGET_REGISTRY_FILENAME = "enrolled-targets.json"
 PUBLIC_COMMAND = "kit"
 INTERNAL_PRODUCT_NAME = "repo-contract-kit"
+DEFAULT_TARGET_IMPORT_EXCLUDES = ("*agent-worktrees*", "*/archive/*")
+DEFAULT_WORKTREE_SCAN_EXCLUDES = (
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    ".next",
+)
 COMPLETION_SHELLS = ("bash", "zsh", "fish")
 STYLE_CHOICES = ("auto", "plain", "pretty")
 START_UPDATE_POLICIES = ("local-safe", "check-only")
@@ -349,6 +362,579 @@ def sidecar_state(repo: Path | None = None) -> dict[str, Any]:
     return payload
 
 
+def target_registry_path() -> Path:
+    return state_base_dir() / TARGET_REGISTRY_FILENAME
+
+
+def read_target_registry() -> dict[str, Any]:
+    path = target_registry_path()
+    payload = read_json(path)
+    if not isinstance(payload, dict) or payload.get("_error"):
+        return {
+            "schema_version": 1,
+            "path": str(path),
+            "targets": [],
+        }
+    targets = payload.get("targets")
+    if not isinstance(targets, list):
+        targets = []
+    payload["schema_version"] = payload.get("schema_version") or 1
+    payload["path"] = str(path)
+    payload["targets"] = [item for item in targets if isinstance(item, dict)]
+    return payload
+
+
+def write_target_registry(payload: dict[str, Any]) -> None:
+    path = target_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def registered_target_entry(repo: Path, source: str) -> dict[str, Any]:
+    identity = repo_identity(repo)
+    install = install_state(repo)
+    return {
+        "root": identity["root"],
+        "id": identity["id"],
+        "hash": identity["hash"],
+        "hash_algorithm": identity["hash_algorithm"],
+        "name": repo.name,
+        "last_seen_at": now(),
+        "last_seen_command": source,
+        "kit_version": kit_version(),
+        "installed": bool(install.get("installed")),
+        "install_version": install.get("kit_version"),
+        "install_source_ref": install.get("source_ref"),
+    }
+
+
+def register_target_repo(repo: Path, source: str) -> dict[str, Any]:
+    registry = read_target_registry()
+    targets = list(registry.get("targets") or [])
+    entry = registered_target_entry(repo, source)
+    previous = next((item for item in targets if item.get("root") == entry["root"]), None)
+    if previous and previous.get("registered_at"):
+        entry["registered_at"] = previous["registered_at"]
+    else:
+        entry["registered_at"] = entry["last_seen_at"]
+    targets = [item for item in targets if item.get("root") != entry["root"]]
+    targets.append(entry)
+    registry.update(
+        {
+            "schema_version": 1,
+            "path": str(target_registry_path()),
+            "updated_at": entry["last_seen_at"],
+            "targets": sorted(targets, key=lambda item: str(item.get("root") or "")),
+        }
+    )
+    write_target_registry(registry)
+    return {
+        "path": str(target_registry_path()),
+        "entry": entry,
+        "target_count": len(registry["targets"]),
+    }
+
+
+def target_registry_summary() -> dict[str, Any]:
+    registry = read_target_registry()
+    return {
+        "path": registry["path"],
+        "target_count": len(registry.get("targets") or []),
+        "updated_at": registry.get("updated_at"),
+        "targets": registry.get("targets") or [],
+    }
+
+
+def target_registry_payload_status(entry: dict[str, Any]) -> dict[str, Any]:
+    root = entry.get("root")
+    item = dict(entry)
+    item["status"] = "unknown"
+    if not root:
+        item.update({"status": "invalid-registry-entry", "error": "Registry entry has no root path."})
+        return item
+    repo_path = Path(str(root)).expanduser()
+    if not repo_path.exists():
+        item.update({"status": "missing", "error": "Registered target path does not exist."})
+        return item
+    git_root_result = run_git(repo_path, ["rev-parse", "--show-toplevel"])
+    if git_root_result.returncode != 0:
+        item.update({"status": "not-git", "error": "Registered target path is not a git repository."})
+        return item
+    repo = Path(git_root_result.stdout.strip()).resolve()
+    item["root"] = str(repo)
+    if not (repo / ".doc-contract-kit" / "install.json").exists():
+        item.update({"status": "not-installed", "error": "Registered target no longer has a kit install receipt."})
+        return item
+    dirty_entries = git_status_entries(repo)
+    item.update(
+        {
+            "status": "dirty" if dirty_entries else "ready",
+            "dirty_count": len(dirty_entries),
+            "dirty_files": sorted({entry["path"] for entry in dirty_entries}),
+        }
+    )
+    return item
+
+
+def target_registry_with_entry(registry: dict[str, Any], repo: Path, source: str) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    targets = list(registry.get("targets") or [])
+    entry = registered_target_entry(repo, source)
+    previous = next((item for item in targets if item.get("root") == entry["root"]), None)
+    if previous and previous.get("registered_at"):
+        entry["registered_at"] = previous["registered_at"]
+    else:
+        entry["registered_at"] = entry["last_seen_at"]
+    changed = previous != entry
+    targets = [item for item in targets if item.get("root") != entry["root"]]
+    targets.append(entry)
+    registry.update(
+        {
+            "schema_version": 1,
+            "path": str(target_registry_path()),
+            "updated_at": entry["last_seen_at"],
+            "targets": sorted(targets, key=lambda item: str(item.get("root") or "")),
+        }
+    )
+    return registry, entry, changed
+
+
+def default_scan_roots(args: argparse.Namespace) -> list[Path]:
+    roots = getattr(args, "root", None) or [str(Path.cwd())]
+    return [Path(root).expanduser() for root in roots]
+
+
+def scan_path_exclude_match(path: Path, patterns: list[str] | tuple[str, ...]) -> str | None:
+    value = path.as_posix()
+    for pattern in patterns:
+        if fnmatch.fnmatch(value, pattern):
+            return pattern
+    return None
+
+
+def target_import_excludes(args: argparse.Namespace) -> list[str]:
+    patterns = list(getattr(args, "exclude", None) or [])
+    if not getattr(args, "include_agent_worktrees", False):
+        patterns.append("*agent-worktrees*")
+    if not getattr(args, "include_archive", False):
+        patterns.append("*/archive/*")
+    return patterns
+
+
+def target_import_receipts(root: Path) -> list[Path]:
+    root = root.resolve()
+    if root.is_file():
+        return [root] if root.name == "install.json" and root.parent.name == ".doc-contract-kit" else []
+    if not root.exists():
+        return []
+    direct = root / ".doc-contract-kit" / "install.json"
+    if direct.exists():
+        return [direct]
+    return sorted(root.rglob(".doc-contract-kit/install.json"))
+
+
+def target_import_scan(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    excludes = target_import_excludes(args)
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+    skip_counts: dict[str, int] = {}
+    for root in default_scan_roots(args):
+        if not root.exists():
+            item = {
+                "root": str(root),
+                "status": "skipped",
+                "skip_reason": "scan-root-missing",
+                "error": "Scan root does not exist.",
+            }
+            items.append(item)
+            skip_counts["scan-root-missing"] = skip_counts.get("scan-root-missing", 0) + 1
+            continue
+        for receipt in target_import_receipts(root):
+            repo = receipt.parent.parent.resolve()
+            repo_key = str(repo)
+            if repo_key in seen:
+                continue
+            seen.add(repo_key)
+            item: dict[str, Any] = {
+                "root": repo_key,
+                "receipt": str(receipt.resolve()),
+                "status": "unknown",
+            }
+            pattern = scan_path_exclude_match(repo, excludes)
+            if pattern:
+                item.update({"status": "skipped", "skip_reason": "excluded", "exclude_pattern": pattern})
+                skip_counts["excluded"] = skip_counts.get("excluded", 0) + 1
+                items.append(item)
+                continue
+            git_root_result = run_git(repo, ["rev-parse", "--show-toplevel"])
+            if git_root_result.returncode != 0:
+                item.update({"status": "skipped", "skip_reason": "not-git", "error": "Install receipt is not inside a git repository."})
+                skip_counts["not-git"] = skip_counts.get("not-git", 0) + 1
+                items.append(item)
+                continue
+            git_root = Path(git_root_result.stdout.strip()).resolve()
+            if git_root != repo:
+                item.update(
+                    {
+                        "status": "skipped",
+                        "skip_reason": "nested-install-receipt",
+                        "git_root": str(git_root),
+                        "error": "Install receipt is below another git root.",
+                    }
+                )
+                skip_counts["nested-install-receipt"] = skip_counts.get("nested-install-receipt", 0) + 1
+                items.append(item)
+                continue
+            item.update({"status": "eligible", "git_root": str(git_root)})
+            items.append(item)
+    return items, skip_counts
+
+
+def target_list_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    registry = read_target_registry()
+    entries = [target_registry_payload_status(entry) for entry in registry.get("targets") or []]
+    status_counts: dict[str, int] = {}
+    for entry in entries:
+        status = str(entry.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    payload = {
+        "schema_version": 1,
+        "command": "target-list",
+        "registry": {
+            "path": str(target_registry_path()),
+            "target_count": len(entries),
+            "updated_at": registry.get("updated_at"),
+        },
+        "summary": {
+            "total": len(entries),
+            "statuses": status_counts,
+        },
+        "targets": entries,
+        "target_repo_writes": target_repo_writes(False, reason="target list is read-only"),
+        "sidecar_writes": sidecar_writes(False, reason="target list is read-only"),
+        "exit_code": 0,
+    }
+    return payload, 0
+
+
+def target_import_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    apply = bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
+    registry = read_target_registry()
+    existing_roots = {str(entry.get("root")) for entry in registry.get("targets") or [] if entry.get("root")}
+    scanned, skip_counts = target_import_scan(args)
+    imported: list[dict[str, Any]] = []
+    changed = False
+    working_registry = dict(registry)
+    for item in scanned:
+        if item.get("status") != "eligible":
+            continue
+        repo = Path(str(item["root"]))
+        if str(repo) in existing_roots:
+            item["status"] = "already-registered"
+            continue
+        item["status"] = "would-import"
+        if apply:
+            working_registry, entry, entry_changed = target_registry_with_entry(working_registry, repo, "target import")
+            changed = changed or entry_changed
+            item["status"] = "imported"
+            item["id"] = entry["id"]
+            imported.append(entry)
+
+    performed = bool(apply and changed)
+    if performed:
+        write_target_registry(working_registry)
+    status_counts: dict[str, int] = {}
+    for item in scanned:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    next_commands: list[str] = []
+    if not apply and status_counts.get("would-import"):
+        next_commands.append(target_import_public_command(args, apply=True))
+    if apply:
+        next_commands.append(public_command("target", "list", "--json"))
+        next_commands.append(public_command("update", "--all", "--dry-run"))
+    payload = {
+        "schema_version": 1,
+        "command": "target-import",
+        "mode": "apply" if apply else "dry-run",
+        "roots": [str(root.resolve()) for root in default_scan_roots(args) if root.exists()],
+        "exclude_patterns": target_import_excludes(args),
+        "registry": {
+            "path": str(target_registry_path()),
+            "target_count": len((working_registry if performed else registry).get("targets") or []),
+            "updated_at": (working_registry if performed else registry).get("updated_at"),
+        },
+        "summary": {
+            "scanned": len(scanned),
+            "eligible": status_counts.get("would-import", 0) + status_counts.get("imported", 0) + status_counts.get("already-registered", 0),
+            "imported": status_counts.get("imported", 0),
+            "would_import": status_counts.get("would-import", 0),
+            "already_registered": status_counts.get("already-registered", 0),
+            "skipped": sum(skip_counts.values()),
+            "skip_reasons": skip_counts,
+            "statuses": status_counts,
+        },
+        "targets": scanned,
+        "target_repo_writes": target_repo_writes(False, reason="target import writes only local kit registry"),
+        "sidecar_writes": sidecar_writes(
+            performed,
+            paths=[str(target_registry_path())] if performed else [],
+            reason="imported targets into local kit registry" if performed else "dry-run or no registry changes",
+        ),
+        "next_commands": next_commands,
+        "exit_code": 0,
+    }
+    return payload, 0
+
+
+def target_import_public_command(args: argparse.Namespace, *, apply: bool) -> str:
+    parts = ["target", "import"]
+    for root in getattr(args, "root", None) or [str(Path.cwd())]:
+        parts.extend(["--root", str(root)])
+    for pattern in getattr(args, "exclude", None) or []:
+        parts.extend(["--exclude", str(pattern)])
+    if getattr(args, "include_agent_worktrees", False):
+        parts.append("--include-agent-worktrees")
+    if getattr(args, "include_archive", False):
+        parts.append("--include-archive")
+    parts.append("--apply" if apply else "--dry-run")
+    return public_command(*parts)
+
+
+def worktree_scan_roots(args: argparse.Namespace) -> list[Path]:
+    return default_scan_roots(args)
+
+
+def worktree_path_is_disposable(path: Path) -> bool:
+    return "agent-worktrees" in path.as_posix()
+
+
+def add_worktree_candidate(candidates: dict[Path, set[str]], path: Path, source: str) -> None:
+    candidates.setdefault(path.resolve(), set()).add(source)
+
+
+def git_marker_kind(path: Path) -> str:
+    marker = path / ".git"
+    if marker.is_file():
+        return "file"
+    if marker.is_dir():
+        return "directory"
+    return "missing"
+
+
+def filesystem_worktree_candidate_paths(root: Path) -> list[Path]:
+    root = root.expanduser()
+    if not root.exists():
+        return []
+    candidates: set[Path] = set()
+    if worktree_path_is_disposable(root) and ((root / ".git").exists() or (root / ".doc-contract-kit" / "install.json").exists()):
+        candidates.add(root.resolve())
+    for current, dirnames, _filenames in os.walk(root):
+        current_path = Path(current)
+        dirnames[:] = [name for name in dirnames if name not in DEFAULT_WORKTREE_SCAN_EXCLUDES]
+        if not worktree_path_is_disposable(current_path):
+            continue
+        if (current_path / ".git").exists() or (current_path / ".doc-contract-kit" / "install.json").exists():
+            candidates.add(current_path.resolve())
+    return sorted(candidates)
+
+
+def git_linked_worktree_candidate_paths(root: Path) -> list[Path]:
+    root = root.expanduser()
+    if not root.exists():
+        return []
+    if run_git(root, ["rev-parse", "--show-toplevel"]).returncode != 0:
+        return []
+    primary = primary_checkout(root)
+    primary_resolved = primary.resolve()
+    candidates: set[Path] = set()
+    for metadata in git_worktrees(primary):
+        raw_path = metadata.get("path")
+        if not raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        if path == primary_resolved:
+            continue
+        if worktree_path_is_disposable(path):
+            candidates.add(path)
+    return sorted(candidates)
+
+
+def worktree_candidate_source_map(root: Path) -> dict[Path, set[str]]:
+    candidates: dict[Path, set[str]] = {}
+    for path in filesystem_worktree_candidate_paths(root):
+        add_worktree_candidate(candidates, path, "filesystem-scan")
+    for path in git_linked_worktree_candidate_paths(root):
+        add_worktree_candidate(candidates, path, "git-worktree-list")
+    return candidates
+
+
+def worktree_candidate_paths(root: Path) -> list[Path]:
+    return sorted(worktree_candidate_source_map(root))
+
+
+def worktree_entry(path: Path, discovery_sources: list[str] | None = None) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "root": str(path),
+        "status": "unknown",
+        "discovery_sources": sorted(discovery_sources or []),
+        "disposable_path": worktree_path_is_disposable(path),
+        "git_marker": git_marker_kind(path),
+        "installed": (path / ".doc-contract-kit" / "install.json").exists(),
+        "removable": False,
+        "blockers": [],
+    }
+    git_root_result = run_git(path, ["rev-parse", "--show-toplevel"])
+    if git_root_result.returncode != 0:
+        item.update({"status": "not-git", "blockers": ["not-git"]})
+        return item
+    git_root = Path(git_root_result.stdout.strip()).resolve()
+    item["git_root"] = str(git_root)
+    if git_root != path.resolve():
+        item["blockers"].append("nested-git-root")
+    branch_result = run_git(path, ["branch", "--show-current"])
+    if branch_result.returncode == 0:
+        item["branch"] = branch_result.stdout.strip()
+    common_result = run_git(path, ["rev-parse", "--git-common-dir"])
+    if common_result.returncode == 0:
+        item["git_common_dir"] = common_result.stdout.strip()
+    dirty_entries = git_status_entries(git_root)
+    item["dirty_count"] = len(dirty_entries)
+    item["dirty_files"] = sorted({entry["path"] for entry in dirty_entries})
+    if dirty_entries:
+        item["blockers"].append("dirty")
+    if item["git_marker"] != "file":
+        item["blockers"].append("not-linked-worktree")
+    if not item["disposable_path"]:
+        item["blockers"].append("not-disposable-path")
+    item["removable"] = not item["blockers"]
+    item["status"] = "removable" if item["removable"] else "blocked"
+    return item
+
+
+def worktree_audit_entries(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    candidates: dict[str, tuple[Path, set[str]]] = {}
+    root_errors: list[dict[str, Any]] = []
+    for root in worktree_scan_roots(args):
+        if not root.exists():
+            root_errors.append({"root": str(root), "status": "missing", "error": "Scan root does not exist."})
+            continue
+        for path, sources in worktree_candidate_source_map(root).items():
+            key = str(path)
+            if key not in candidates:
+                candidates[key] = (path, set())
+            candidates[key][1].update(sources)
+    entries = [
+        worktree_entry(path, sorted(sources))
+        for _key, (path, sources) in sorted(candidates.items(), key=lambda item: item[0])
+    ]
+    return entries, root_errors
+
+
+def worktree_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    blocker_counts: dict[str, int] = {}
+    discovery_sources: set[str] = set()
+    for entry in entries:
+        status = str(entry.get("status") or "unknown")
+        statuses[status] = statuses.get(status, 0) + 1
+        for source in entry.get("discovery_sources") or []:
+            discovery_sources.add(str(source))
+        for blocker in entry.get("blockers") or []:
+            blocker_counts[str(blocker)] = blocker_counts.get(str(blocker), 0) + 1
+    return {
+        "total": len(entries),
+        "removable": statuses.get("removable", 0),
+        "blocked": statuses.get("blocked", 0),
+        "dirty": blocker_counts.get("dirty", 0),
+        "discovery_sources": sorted(discovery_sources),
+        "statuses": statuses,
+        "blockers": blocker_counts,
+    }
+
+
+def worktree_audit_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    entries, root_errors = worktree_audit_entries(args)
+    payload = {
+        "schema_version": 1,
+        "command": "worktree-audit",
+        "mode": "audit",
+        "roots": [str(root.resolve()) for root in worktree_scan_roots(args) if root.exists()],
+        "root_errors": root_errors,
+        "summary": worktree_summary(entries),
+        "worktrees": entries,
+        "target_repo_writes": target_repo_writes(False, reason="worktree audit is read-only"),
+        "sidecar_writes": sidecar_writes(False, reason="worktree audit is read-only"),
+        "exit_code": 0,
+    }
+    return payload, 0
+
+
+def worktree_remove(path: Path, force: bool = False) -> subprocess.CompletedProcess[str]:
+    command = ["git", "worktree", "remove"]
+    if force:
+        command.append("--force")
+    command.append(str(path))
+    return subprocess.run(command, cwd=path, capture_output=True, text=True, check=False)
+
+
+def worktree_prune_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    apply = bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
+    entries, root_errors = worktree_audit_entries(args)
+    removed_paths: list[str] = []
+    failed_count = 0
+    for entry in entries:
+        if not entry.get("removable"):
+            entry["prune_status"] = "skipped"
+            continue
+        entry["prune_status"] = "would-remove"
+        if apply:
+            path = Path(str(entry["root"]))
+            result = worktree_remove(path, force=bool(getattr(args, "force", False)))
+            if result.returncode == 0:
+                entry["prune_status"] = "removed"
+                removed_paths.append(str(path))
+            else:
+                entry["prune_status"] = "failed"
+                entry["error"] = result.stderr.strip() or result.stdout.strip() or "git worktree remove failed"
+                failed_count += 1
+    summary = worktree_summary(entries)
+    summary["removed"] = sum(1 for entry in entries if entry.get("prune_status") == "removed")
+    summary["would_remove"] = sum(1 for entry in entries if entry.get("prune_status") == "would-remove")
+    summary["failed"] = failed_count
+    next_commands: list[str] = []
+    if not apply and summary["would_remove"]:
+        parts = ["worktree", "prune"]
+        for root in getattr(args, "root", None) or [str(Path.cwd())]:
+            parts.extend(["--root", str(root)])
+        parts.append("--apply")
+        next_commands.append(public_command(*parts))
+    payload = {
+        "schema_version": 1,
+        "command": "worktree-prune",
+        "mode": "apply" if apply else "dry-run",
+        "roots": [str(root.resolve()) for root in worktree_scan_roots(args) if root.exists()],
+        "root_errors": root_errors,
+        "summary": summary,
+        "worktrees": entries,
+        "target_repo_writes": target_repo_writes(
+            bool(removed_paths),
+            paths=removed_paths,
+            reason="removed clean disposable linked worktrees" if removed_paths else "dry-run or no removable worktrees",
+        ),
+        "sidecar_writes": sidecar_writes(False, reason="worktree prune does not write kit sidecar state"),
+        "filesystem_writes": {
+            "performed": bool(removed_paths),
+            "paths": removed_paths,
+            "reason": "removed clean disposable linked worktrees" if removed_paths else "dry-run or no removable worktrees",
+        },
+        "next_commands": next_commands,
+        "exit_code": 1 if failed_count else 0,
+    }
+    return payload, payload["exit_code"]
+
+
 def write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -586,10 +1172,15 @@ def cli_metadata() -> dict[str, Any]:
             "start",
             "self update",
             "target add",
+            "target import --apply",
+            "target prune-missing --apply",
             "target repair-source-clone --apply",
             "target update",
+            "target update-all --apply",
             "update",
+            "update --all --apply",
             "update --global",
+            "worktree prune --apply",
             "migrate-config",
         ],
         "sidecar_write_commands": [
@@ -603,6 +1194,8 @@ def cli_metadata() -> dict[str, Any]:
             "review-plan --write-sidecar",
             "docs-propose --write-sidecar",
             "onboarding-pr --write-sidecar",
+            "target import --apply",
+            "target prune-missing --apply",
             "task-packet --write-sidecar",
             "agent-task-packet-from-backlog --write-sidecar",
             "verify --write-sidecar",
@@ -1019,6 +1612,32 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
                 "exit_code",
             ],
         },
+        ("closeout-plan",): {
+            "audience": ["human", "agent"],
+            "mutation": "read-only",
+            "sidecar_write": "never",
+            "route_role": "canonical",
+            "canonical_command": "closeout-plan",
+            "alias_group": "task-closeout",
+            "route_note": "`kit closeout-plan` translates task, dirty-state, receipt, and closeout evidence into whether work can truthfully be claimed done.",
+            "examples": [
+                public_command("closeout-plan", "--repo", "/path/to/repo", "--json"),
+                public_command("closeout-plan", "--repo", "/path/to/repo", "--strict"),
+            ],
+            "output_schema": "closeout_plan_payload",
+            "docs": ["docs/agent-guide.md", "docs/cli-reference.md"],
+            "stable_payload_fields": [
+                "schema_version",
+                "command",
+                "target_repo_writes",
+                "sidecar_writes",
+                "can_claim_done",
+                "completion_state",
+                "next_action",
+                "claim_blockers",
+                "exit_code",
+            ],
+        },
         ("self",): {
             "audience": ["human", "agent"],
             "mutation": "namespace",
@@ -1326,6 +1945,24 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
                 "kit_drift",
             ],
         },
+        ("target", "list"): {
+            "audience": ["human", "agent"],
+            "mutation": "read-only",
+            "route_note": "Lists the local enrolled-target registry used by batch updates and reports missing or unenrolled entries.",
+            "examples": [public_command("target", "list", "--json")],
+            "output_schema": "target_list_payload",
+        },
+        ("target", "import"): {
+            "audience": ["human", "agent"],
+            "mutation": "writes-local-kit-registry-with-apply",
+            "sidecar_write": "with --apply",
+            "route_note": "Seeds the local enrolled-target registry from installed repo receipts under one or more roots. Dry-run is the default; agent-worktrees and archive paths are excluded unless explicitly included.",
+            "examples": [
+                public_command("target", "import", "--root", "/Volumes/Myrtle/Code/04_Code", "--dry-run", "--json"),
+                public_command("target", "import", "--root", "/Volumes/Myrtle/Code/04_Code", "--apply", "--json"),
+            ],
+            "output_schema": "target_import_payload",
+        },
         ("target", "doctor"): {
             "audience": ["human", "agent"],
             "mutation": "read-only",
@@ -1360,6 +1997,56 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
             "examples": [public_command("target", "update", "--repo", "/path/to/repo", "--dry-run", "--json")],
             "output_schema": "install_update_payload",
         },
+        ("target", "prune-missing"): {
+            "audience": ["human", "agent"],
+            "mutation": "writes-local-kit-registry-with-apply",
+            "sidecar_write": "with --apply",
+            "route_note": "Removes enrolled-target registry entries whose repo path no longer exists. Dry-run is the default and --apply is required for registry writes.",
+            "examples": [
+                public_command("target", "prune-missing", "--dry-run", "--json"),
+                public_command("target", "prune-missing", "--apply", "--json"),
+            ],
+            "output_schema": "target_prune_missing_payload",
+        },
+        ("target", "update-all"): {
+            "audience": ["human", "agent"],
+            "mutation": "writes-targets-with-apply",
+            "target_repo_write": "with --apply",
+            "route_role": "canonical",
+            "canonical_command": "target update-all",
+            "alias_group": "target-update",
+            "route_note": "Updates every registered enrolled target repo from the global tool checkout; dry-run is the default and --apply is required for writes.",
+            "examples": [
+                public_command("target", "update-all", "--dry-run", "--json"),
+                public_command("target", "update-all", "--apply", "--json"),
+            ],
+            "output_schema": "target_update_all_payload",
+        },
+        ("worktree",): {
+            "audience": ["human", "agent"],
+            "mutation": "namespace",
+            "json_supported": False,
+            "examples": [public_command("worktree", "audit", "--root", "/path/to/repo-or-parent", "--json")],
+            "output_schema": "subcommand_namespace",
+        },
+        ("worktree", "audit"): {
+            "audience": ["human", "agent"],
+            "mutation": "read-only",
+            "route_note": "Scans one or more repo or directory roots for disposable agent worktrees, adds Git-linked sibling worktrees for Git roots, reports dirty state, and marks clean linked worktrees as prune candidates.",
+            "examples": [public_command("worktree", "audit", "--root", "/Volumes/Myrtle/MiniProjects/MiniCommand", "--json")],
+            "output_schema": "worktree_audit_payload",
+        },
+        ("worktree", "prune"): {
+            "audience": ["human", "agent"],
+            "mutation": "removes-clean-disposable-worktrees-with-apply",
+            "target_repo_write": "with --apply",
+            "route_note": "Removes only clean linked worktrees under agent-worktrees paths discovered from repo or directory roots. Dry-run is the default and dirty or standalone repos are reported, not removed.",
+            "examples": [
+                public_command("worktree", "prune", "--root", "/Volumes/Myrtle/MiniProjects/MiniCommand", "--dry-run", "--json"),
+                public_command("worktree", "prune", "--root", "/Volumes/Myrtle/MiniProjects/MiniCommand", "--apply", "--json"),
+            ],
+            "output_schema": "worktree_prune_payload",
+        },
         ("migrate-config",): {
             "audience": ["agent"],
             "mutation": "writes-target-metadata",
@@ -1373,7 +2060,13 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
         ("update",): {
             "audience": ["human", "agent"],
             "mutation": "writes-target-by-default",
-            "examples": [public_command("update", "--dry-run", "--json"), public_command("update", "--json")],
+            "route_note": "`kit update --all` is the short route for registered target batch updates; it defaults to dry-run and needs --apply for writes.",
+            "examples": [
+                public_command("update", "--dry-run", "--json"),
+                public_command("update", "--json"),
+                public_command("update", "--all", "--dry-run", "--json"),
+                public_command("update", "--all", "--apply", "--json"),
+            ],
             "output_schema": "install_update_payload",
         },
     }
@@ -1936,6 +2629,58 @@ def dirty_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "untracked_files": sorted(set(untracked)),
         "staged_files": sorted(set(staged)),
         "unstaged_files": sorted(set(unstaged)),
+    }
+
+
+def git_worktree_state_payload(repo: Path, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = dirty_summary(entries)
+    return {
+        "state": "dirty" if summary["dirty"] else "clean",
+        "source": "git status --porcelain=v1 --untracked-files=all",
+        "root": str(repo),
+        "dirty": summary["dirty"],
+        "count": summary["count"],
+        "tracked_count": summary["tracked_count"],
+        "untracked_count": summary["untracked_count"],
+        "staged_count": summary["staged_count"],
+        "unstaged_count": summary["unstaged_count"],
+        "changed_files": sorted({entry["path"] for entry in entries}),
+        "entries": entries,
+    }
+
+
+def kit_managed_state_payload(repo: Path, install: dict[str, Any]) -> dict[str, Any]:
+    status = install.get("managed_file_status") if isinstance(install, dict) else None
+    report = latest_update_report(repo)
+    proposal_paths = update_proposal_paths(report) if isinstance(report, dict) else []
+    if not install.get("installed"):
+        state = "not-installed"
+        reason = "repo-contract-kit is not installed in this target repo"
+    elif not isinstance(status, dict):
+        state = "unknown"
+        reason = "managed-file manifest status is unavailable"
+    elif proposal_paths:
+        state = "needs-review"
+        reason = "managed update proposals exist under .doc-contract-kit/updates"
+    elif status.get("missing") or status.get("modified"):
+        state = "modified"
+        reason = "managed files differ from the installed manifest"
+    else:
+        state = "clean"
+        reason = "managed files match the installed manifest and no proposals are pending"
+    return {
+        "state": state,
+        "reason": reason,
+        "dirty_equivalent": False,
+        "managed_count": (status or {}).get("managed", 0),
+        "missing_count": len((status or {}).get("missing") or []),
+        "modified_count": len((status or {}).get("modified") or []),
+        "missing_files": (status or {}).get("missing") or [],
+        "modified_files": (status or {}).get("modified") or [],
+        "proposal_count": len(proposal_paths),
+        "proposal_paths": proposal_paths,
+        "latest_update_report": report.get("path") if isinstance(report, dict) else None,
+        "note": "This is kit-managed template/proposal state, not Git worktree dirt.",
     }
 
 
@@ -2738,9 +3483,12 @@ def kit_drift_diagnostics(repo: Path, install: dict[str, Any], local_kit: dict[s
 
 
 def status_payload(repo: Path) -> dict[str, Any]:
-    changed = changed_files(repo, "working-tree")
+    entries = git_status_entries(repo)
+    changed = sorted({entry["path"] for entry in entries})
     local_kit = kit_status.local_kit_state(ROOT)
     install = install_state(repo)
+    git_worktree_state = git_worktree_state_payload(repo, entries)
+    kit_managed_state = kit_managed_state_payload(repo, install)
     return {
         "schema_version": 1,
         "command": "status",
@@ -2754,6 +3502,8 @@ def status_payload(repo: Path) -> dict[str, Any]:
             "dirty": bool(changed),
             "changed_files": changed,
         },
+        "git_worktree_state": git_worktree_state,
+        "kit_managed_state": kit_managed_state,
         "install": install,
         "target_version": read_text(repo / "VERSION"),
         "local_kit": {
@@ -3423,6 +4173,345 @@ def render_agent_state_ledger(payload: dict[str, Any]) -> None:
     print(" - next safe commands:")
     for command in payload.get("next_safe_commands") or []:
         print(f"   - {command}")
+
+
+def closeout_dirty_file_groups(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        path = entry.get("path") or ""
+        group = path.split("/", 1)[0] if "/" in path else "(root)"
+        payload = groups.setdefault(
+            group,
+            {
+                "group": group,
+                "count": 0,
+                "tracked_count": 0,
+                "untracked_count": 0,
+                "staged_count": 0,
+                "unstaged_count": 0,
+                "files": [],
+            },
+        )
+        code = entry.get("code") or ""
+        payload["count"] += 1
+        payload["files"].append({"path": path, "code": code})
+        if code == "??":
+            payload["untracked_count"] += 1
+            continue
+        payload["tracked_count"] += 1
+        if code[:1] != " ":
+            payload["staged_count"] += 1
+        if len(code) > 1 and code[1:2] != " ":
+            payload["unstaged_count"] += 1
+    return [groups[key] for key in sorted(groups)]
+
+
+def closeout_plan_action(command: str, reason: str, *, task_id: str | None = None, mutating: bool = False) -> dict[str, Any]:
+    return {
+        "command": command,
+        "reason": reason,
+        "task_id": task_id or "",
+        "mutating": mutating,
+    }
+
+
+def closeout_plan_relevant_blocked_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    relevant = []
+    for item in items:
+        reasons = set(item.get("reasons") or [])
+        if "primary checkout is never removed" in reasons:
+            continue
+        relevant.append(item)
+    return relevant
+
+
+def task_brief(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": task.get("task_id"),
+        "status": task.get("status"),
+        "owner": task.get("owner"),
+        "owner_label": task.get("owner_label"),
+        "session_id": task.get("session_id"),
+        "thread_id": task.get("thread_id"),
+        "automation_id": task.get("automation_id"),
+        "attribution": task.get("attribution") or {},
+        "worktree": task.get("worktree"),
+        "dirty": bool(task.get("dirty")),
+        "dirty_count": task.get("dirty_count", 0),
+        "missing_worktree": bool(task.get("missing_worktree")),
+        "missing_final_receipt": bool(task.get("missing_final_receipt")),
+        "stale_lease": bool(task.get("stale_lease")),
+        "active_overlap": bool(task.get("active_overlap")),
+        "final_receipt": task.get("final_receipt") or {},
+        "latest_receipt": task.get("latest_receipt") or {},
+        "next_safe_command": task.get("next_safe_command") or "",
+        "unresolved": task.get("unresolved") or [],
+    }
+
+
+def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
+    primary = primary_checkout(repo)
+    status = status_payload(primary)
+    git_worktree_state = status.get("git_worktree_state") or {}
+    kit_managed_state = status.get("kit_managed_state") or {}
+    ledger = agent_state_ledger_payload(args, primary)
+    dirty = ledger.get("dirty") or {}
+    task_status = ledger.get("task_status") or {}
+    task_summary = task_status.get("summary") or {}
+    tasks = task_status.get("tasks") or []
+    closeout = ledger.get("closeout_state") or {}
+    closeout_blocked = closeout_plan_relevant_blocked_items(closeout.get("closeout_blocked", []) or [])
+    closeout_blocked_count = len(closeout_blocked)
+    unresolved = ledger.get("unresolved") or {}
+    blockers = unresolved.get("blockers") or []
+    warnings = unresolved.get("warnings") or []
+    warning_codes = {item.get("code") for item in warnings}
+    blocker_codes = {item.get("code") for item in blockers}
+
+    active_tasks = [task_brief(task) for task in tasks if task.get("status") == "in-progress"]
+    terminal_missing_receipts = [task_brief(task) for task in tasks if task.get("missing_final_receipt")]
+    dirty_worktree_tasks = [task_brief(task) for task in tasks if task.get("dirty")]
+    blocked_task_states = [
+        task_brief(task)
+        for task in tasks
+        if task.get("missing_worktree") or task.get("stale_lease") or task.get("active_overlap")
+    ]
+
+    claim_blockers: list[dict[str, Any]] = []
+    if dirty.get("dirty"):
+        claim_blockers.append(
+            {
+                "code": "dirty_primary_checkout",
+                "message": "Primary checkout has uncommitted changes; record integration or clean the checkout before claiming completion.",
+                "count": dirty.get("count", 0),
+            }
+        )
+    if active_tasks:
+        claim_blockers.append(
+            {
+                "code": "active_tasks",
+                "message": "One or more task records are still in progress.",
+                "count": len(active_tasks),
+            }
+        )
+    if terminal_missing_receipts:
+        claim_blockers.append(
+            {
+                "code": "missing_final_receipts",
+                "message": "Terminal task metadata is missing durable final receipt evidence.",
+                "count": len(terminal_missing_receipts),
+            }
+        )
+    if dirty_worktree_tasks:
+        claim_blockers.append(
+            {
+                "code": "dirty_task_worktrees",
+                "message": "One or more task worktrees have uncommitted changes.",
+                "count": len(dirty_worktree_tasks),
+            }
+        )
+    if blocked_task_states:
+        claim_blockers.append(
+            {
+                "code": "blocked_task_state",
+                "message": "Task metadata has missing, stale, or overlapping worktree state.",
+                "count": len(blocked_task_states),
+            }
+        )
+    if closeout.get("closeout_candidate_count", 0):
+        claim_blockers.append(
+            {
+                "code": "closeout_candidates",
+                "message": "Finished task worktrees are eligible for reviewed closeout.",
+                "count": closeout.get("closeout_candidate_count", 0),
+            }
+        )
+    if closeout_blocked_count:
+        claim_blockers.append(
+            {
+                "code": "closeout_blocked",
+                "message": "Closeout preview has blocked worktrees that need inspection.",
+                "count": closeout_blocked_count,
+            }
+        )
+    if kit_managed_state.get("state") == "needs-review":
+        claim_blockers.append(
+            {
+                "code": "kit_managed_review",
+                "message": "Kit managed-file proposals are pending review; this is not Git dirt, but it must be accepted, rejected, or receipted before closeout.",
+                "count": kit_managed_state.get("proposal_count", 0),
+                "latest_update_report": kit_managed_state.get("latest_update_report"),
+            }
+        )
+
+    external_blockers = [
+        item
+        for item in blockers
+        if item.get("code") not in {"missing_final_receipt", "active_overlap", "missing_worktree"}
+    ]
+    if external_blockers:
+        claim_blockers.append(
+            {
+                "code": "external_blockers",
+                "message": "Ledger reported automation, receipt, or other repository blockers.",
+                "count": len(external_blockers),
+            }
+        )
+
+    if dirty.get("dirty"):
+        completion_state = "needs-integration"
+        next_action = closeout_plan_action(
+            "git status --short",
+            "Inspect and either preserve, commit, hand off, or explicitly receipt the dirty primary checkout.",
+        )
+    elif blocked_task_states or external_blockers or "automation_handoff_blocked" in blocker_codes or "automation_baseline_blocked" in blocker_codes:
+        completion_state = "blocked"
+        next_action = closeout_plan_action(
+            "make agent-task-status TASK_STATUS_STRICT=1",
+            "Resolve missing, stale, overlapping, or externally blocked task state before closeout.",
+        )
+    elif terminal_missing_receipts:
+        task_id = terminal_missing_receipts[0].get("task_id") or "<id>"
+        completion_state = "needs-receipt"
+        next_action = closeout_plan_action(
+            f"make agent-task-link-receipt TASK={task_id} TASK_RECEIPT=<path>",
+            "Link durable final receipt evidence for the terminal task.",
+            task_id=task_id,
+            mutating=True,
+        )
+    elif active_tasks:
+        first = active_tasks[0]
+        task_id = first.get("task_id") or "<id>"
+        command = first.get("next_safe_command") or f"make agent-task-ready TASK={task_id} TASK_READY_JSON=1"
+        if first.get("final_receipt", {}).get("exists"):
+            completion_state = "needs-finalizer"
+            reason = "Finalize the active task with its linked final receipt."
+            mutating = True
+        else:
+            completion_state = "needs-receipt"
+            reason = "Run readiness and produce or link final receipt evidence before finalizing the active task."
+            mutating = False
+        next_action = closeout_plan_action(command, reason, task_id=task_id, mutating=mutating)
+    elif closeout.get("closeout_candidate_count", 0):
+        completion_state = "needs-cleanup"
+        next_action = closeout_plan_action(
+            "make agent-task-closeout TASK_CLOSEOUT_APPLY=1",
+            "Review the closeout dry run, then apply removal for eligible finished task worktrees.",
+            mutating=True,
+        )
+    elif closeout_blocked_count:
+        completion_state = "blocked"
+        next_action = closeout_plan_action(
+            "make agent-task-closeout TASK_CLOSEOUT_JSON=1",
+            "Inspect blocked closeout entries and resolve their safety reasons.",
+        )
+    elif kit_managed_state.get("state") == "needs-review":
+        completion_state = "needs-kit-review"
+        next_action = closeout_plan_action(
+            "review .doc-contract-kit/updates/ and either accept, reject, or receipt the proposals",
+            "Resolve managed-file update proposals without describing them as Git worktree dirt.",
+        )
+    else:
+        completion_state = "clean"
+        next_action = closeout_plan_action(
+            "none",
+            "No dirty checkout, active task, missing receipt, or closeout blocker prevents claiming completion.",
+        )
+
+    can_claim_done = not claim_blockers
+    nonblocking_warning_codes = sorted(
+        code for code in warning_codes if code in {"missing_sidecar", "receipt_warning", "task_status_warning", "closeout_warning"}
+    )
+    exit_code = 1 if args.strict and not can_claim_done else 0
+    return {
+        "schema_version": 1,
+        "command": "closeout-plan",
+        "repo": str(primary),
+        "invoked_from": str(repo),
+        "created_at": now(),
+        "target_repo_writes": False,
+        "sidecar_writes": False,
+        "write_guarantees": {
+            "target_repo_writes": target_repo_writes(False, reason="closeout-plan is read-only"),
+            "sidecar_writes": sidecar_writes(False, reason="closeout-plan is read-only"),
+        },
+        "can_claim_done": can_claim_done,
+        "completion_state": completion_state,
+        "result": "ok" if can_claim_done else "blocked",
+        "strict": bool(args.strict),
+        "next_action": next_action,
+        "claim_blockers": claim_blockers,
+        "nonblocking_warnings": nonblocking_warning_codes,
+        "git_worktree_state": git_worktree_state,
+        "kit_managed_state": kit_managed_state,
+        "dirty": dirty,
+        "dirty_file_groups": closeout_dirty_file_groups(dirty.get("entries") or []),
+        "task_summary": task_summary,
+        "active_tasks": active_tasks,
+        "terminal_missing_receipts": terminal_missing_receipts,
+        "dirty_worktree_tasks": dirty_worktree_tasks,
+        "blocked_task_states": blocked_task_states,
+        "closeout": {
+            "source_command": closeout.get("source_command"),
+            "exit_code": closeout.get("exit_code"),
+            "candidate_count": closeout.get("closeout_candidate_count", 0),
+            "blocked_count": closeout_blocked_count,
+            "raw_blocked_count": closeout.get("closeout_blocked_count", 0),
+            "retained_count": closeout.get("closeout_retained_count", 0),
+            "candidates": closeout.get("closeout_candidates", []),
+            "blocked": closeout_blocked,
+        },
+        "ledger_result": ledger.get("result"),
+        "ledger_unresolved": unresolved,
+        "next_safe_commands": ledger.get("next_safe_commands") or [],
+        "source_commands": {
+            "ledger": "make agent-state-ledger STATE_LEDGER_JSON=1",
+            "task_status": "make agent-task-status TASK_STATUS_INCLUDE_CLOSED=1 TASK_STATUS_JSON=1",
+            "closeout_preview": "make agent-task-closeout TASK_CLOSEOUT_JSON=1",
+        },
+        "exit_code": exit_code,
+    }
+
+
+def render_closeout_plan(payload: dict[str, Any]) -> None:
+    print(f"kit closeout-plan for {payload['repo']}:")
+    print(f" - can claim done: {str(payload['can_claim_done']).lower()}")
+    print(f" - completion state: {payload['completion_state']}")
+    print(f" - writes: target=false sidecar=false")
+    dirty = payload.get("dirty") or {}
+    git_state = payload.get("git_worktree_state") or {}
+    managed_state = payload.get("kit_managed_state") or {}
+    task_summary = payload.get("task_summary") or {}
+    closeout = payload.get("closeout") or {}
+    print(f" - dirty checkout: {str(dirty.get('dirty')).lower()} ({dirty.get('count', 0)} changed)")
+    if git_state:
+        print(f" - git worktree state: {git_state.get('state')} ({git_state.get('count', 0)} changed)")
+    if managed_state:
+        print(
+            " - kit managed state: "
+            f"{managed_state.get('state')} "
+            f"({managed_state.get('proposal_count', 0)} proposals; not Git dirt)"
+        )
+    print(f" - tasks: {task_summary.get('active_task_count', 0)} active / {task_summary.get('task_count', 0)} total")
+    print(f" - closeout: {closeout.get('candidate_count', 0)} candidate / {closeout.get('blocked_count', 0)} blocked")
+    if payload.get("claim_blockers"):
+        print(" - claim blockers:")
+        for item in payload["claim_blockers"]:
+            print(f"   - {item.get('code')}: {item.get('message')} ({item.get('count', 0)})")
+    if payload.get("active_tasks"):
+        print(" - active tasks:")
+        for task in payload["active_tasks"][:10]:
+            print(f"   - {task.get('task_id')}: {task.get('status')} -> {task.get('next_safe_command')}")
+            attribution = task.get("attribution") or {}
+            if attribution:
+                print(f"     attribution: {render_attribution(attribution)}")
+    if payload.get("dirty_file_groups"):
+        print(" - dirty file groups:")
+        for group in payload["dirty_file_groups"][:10]:
+            print(f"   - {group['group']}: {group['count']} changed")
+    action = payload.get("next_action") or {}
+    print(" - next action:")
+    print(f"   - {action.get('command')}: {action.get('reason')}")
 
 
 def render_feedback(payload: dict[str, Any]) -> None:
@@ -5498,6 +6587,26 @@ def render_status(payload: dict[str, Any]) -> None:
     )
     print(f"repo: {payload['repo']}")
     print(f"dirty: {str(payload['git']['dirty']).lower()}")
+    git_state = payload.get("git_worktree_state") or {}
+    managed_state = payload.get("kit_managed_state") or {}
+    if git_state:
+        print("Worktree state:")
+        print(
+            " - git worktree: "
+            f"{git_state.get('state', 'unknown')} "
+            f"({git_state.get('count', 0)} changed; "
+            f"tracked/untracked {git_state.get('tracked_count', 0)}/{git_state.get('untracked_count', 0)})"
+        )
+    if managed_state:
+        print("Kit managed state:")
+        print(
+            " - managed files: "
+            f"{managed_state.get('state', 'unknown')} "
+            f"({managed_state.get('modified_count', 0)} modified, "
+            f"{managed_state.get('missing_count', 0)} missing, "
+            f"{managed_state.get('proposal_count', 0)} proposals)"
+        )
+        print(" - note: kit managed state is not Git dirty state")
     print(f"repo-contract-kit installed: {str(install['installed']).lower()}")
     print("Version roles:")
     print(f" - running tool version: {running_version}")
@@ -7650,6 +8759,7 @@ def render_options(include_advanced: bool = False) -> None:
     print(f"  {PUBLIC_COMMAND} task-packet --harness-mode auto --json")
     print(f"  {PUBLIC_COMMAND} verify --harness-mode auto --json")
     print(f"  {PUBLIC_COMMAND} update --dry-run --json          Preview managed-file updates")
+    print(f"  {PUBLIC_COMMAND} closeout-plan --json             Check whether work can be claimed done")
     print("")
     print("Daily commands:")
     print(f"  {PUBLIC_COMMAND} start                   Choose the next human/agent journey")
@@ -7659,7 +8769,9 @@ def render_options(include_advanced: bool = False) -> None:
     print(f"  {PUBLIC_COMMAND} mode-check              Show harness mode selection")
     print(f"  {PUBLIC_COMMAND} update --dry-run        Preview managed-file updates")
     print(f"  {PUBLIC_COMMAND} update                  Apply safe managed-file updates")
+    print(f"  {PUBLIC_COMMAND} update --all --dry-run  Preview updates for registered target repos")
     print(f"  {PUBLIC_COMMAND} doctor                  Diagnose dirty state and task blockers")
+    print(f"  {PUBLIC_COMMAND} closeout-plan           Decide whether work is actually closed out")
     print(f"  {PUBLIC_COMMAND} palette                 Search commands in a TTY")
     print(f"  {PUBLIC_COMMAND} completion zsh          Print shell completion code")
     print("")
@@ -7701,6 +8813,7 @@ def render_options(include_advanced: bool = False) -> None:
         "agent-preflight --repo /path/to/repo --json",
         "agent-context-bundle --repo /path/to/repo --json",
         "agent-state-ledger --repo /path/to/repo --json",
+        "closeout-plan --repo /path/to/repo --json",
         "branch-readiness --repo /path/to/repo --json",
         "doc-impact --repo /path/to/repo --working-tree --json",
         "update-plan --repo /path/to/repo --json",
@@ -7753,10 +8866,32 @@ def run_guide_interactive(payload: dict[str, Any], force_non_interactive: bool =
     return main(command)
 
 
+def setup_closeout_payload(repo: Path, write_paths: list[str]) -> dict[str, Any]:
+    needs_commit = bool(write_paths)
+    return {
+        "status": "needs-commit-or-park" if needs_commit else "no-target-writes",
+        "written_paths": write_paths,
+        "next_commands": [
+            "git status --short",
+            public_command("status", "--repo", str(repo), "--json"),
+            public_command("closeout-plan", "--repo", str(repo), "--json"),
+        ],
+        "decision": (
+            "Commit the setup footprint deliberately, or remove/park it if enrollment was exploratory."
+            if needs_commit
+            else "No setup footprint was written."
+        ),
+        "note": "Setup/enrollment files are target repo writes and need explicit repository closeout.",
+    }
+
+
 def run_mutating_script(command: list[str], repo: Path, json_output: bool, writes_on_success: bool) -> int:
     before_status = git_status_entries(repo)
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
     writes_performed = writes_on_success and result.returncode == 0
+    target_registry = None
+    if writes_performed and Path(command[1]).name in {"install.py", "update.py"}:
+        target_registry = register_target_repo(repo, Path(command[1]).stem)
     if writes_performed:
         write_reason = "explicit install/update command"
     elif result.returncode != 0:
@@ -7796,6 +8931,10 @@ def run_mutating_script(command: list[str], repo: Path, json_output: bool, write
         }
         if update_report:
             payload["update_report"] = update_report
+        if Path(command[1]).name == "install.py":
+            payload["setup_closeout"] = setup_closeout_payload(repo, write_paths if writes_performed else [])
+        if target_registry:
+            payload["target_registry"] = target_registry
         render_json(
             payload
         )
@@ -7999,6 +9138,364 @@ def run_update_script(
     return result.returncode
 
 
+def target_update_all_script_command(args: argparse.Namespace, repo: Path, *, apply: bool) -> list[str]:
+    command = [sys.executable, str(ROOT / "scripts" / "update.py"), str(repo), "--apply" if apply else "--dry-run"]
+    if getattr(args, "metadata_only", False):
+        command.append("--metadata-only")
+    if getattr(args, "force_managed", False):
+        command.append("--force-managed")
+    for flag, attr in (
+        ("--preset", "preset"),
+        ("--profiles", "profiles"),
+        ("--runtime-adapters", "runtime_adapters"),
+    ):
+        value = getattr(args, attr, None)
+        if value:
+            command.extend([flag, str(value)])
+    for value in getattr(args, "runtime_adapter", None) or []:
+        command.extend(["--runtime-adapter", str(value)])
+    return command
+
+
+def target_update_all_run_target(args: argparse.Namespace, entry: dict[str, Any], *, apply: bool) -> dict[str, Any]:
+    root = entry.get("root")
+    result: dict[str, Any] = {
+        "root": root,
+        "id": entry.get("id"),
+        "name": entry.get("name"),
+        "status": "unknown",
+        "target_repo_writes": target_repo_writes(False, reason="not attempted"),
+    }
+    if not root:
+        result.update({"status": "invalid-registry-entry", "exit_code": 2, "error": "Registry entry has no root path."})
+        return result
+
+    repo_path = Path(str(root)).expanduser()
+    if not repo_path.exists():
+        result.update({"status": "missing", "exit_code": 2, "error": "Registered target path does not exist."})
+        return result
+    git_root_result = run_git(repo_path, ["rev-parse", "--show-toplevel"])
+    if git_root_result.returncode != 0:
+        result.update({"status": "not-git", "exit_code": 2, "error": "Registered target path is not a git repository."})
+        return result
+    repo = Path(git_root_result.stdout.strip()).resolve()
+    result["root"] = str(repo)
+    if not (repo / ".doc-contract-kit" / "install.json").exists():
+        result.update({"status": "not-installed", "exit_code": 2, "error": "Registered target no longer has a kit install receipt."})
+        return result
+
+    dirty_entries = git_status_entries(repo)
+    if apply and dirty_entries:
+        result.update(
+            {
+                "status": "skipped-dirty",
+                "exit_code": 1,
+                "dirty_count": len(dirty_entries),
+                "dirty_files": sorted({item["path"] for item in dirty_entries}),
+                "target_repo_writes": target_repo_writes(False, reason="skipped dirty target before apply"),
+            }
+        )
+        return result
+
+    command = target_update_all_script_command(args, repo, apply=apply)
+    plan_result = subprocess.run(update_plan_command(command), cwd=ROOT, capture_output=True, text=True, check=False)
+    plan_payload = parse_json_stdout(plan_result)
+    if not plan_payload:
+        result.update(
+            {
+                "status": "failed",
+                "exit_code": plan_result.returncode or 1,
+                "error": "Target update plan did not return JSON.",
+                "stderr": plan_result.stderr,
+            }
+        )
+        return result
+
+    blockers = list(plan_payload.get("blockers") or [])
+    warnings = list(plan_payload.get("warnings") or [])
+    actions = list(plan_payload.get("actions") or [])
+    conflicts = list(plan_payload.get("conflicts") or [])
+    result.update(
+        {
+            "plan": {
+                "actions": len(actions),
+                "conflicts": len(conflicts),
+                "blockers": len(blockers),
+                "warnings": len(warnings),
+                "detected_state": (plan_payload.get("detected_state") or {}).get("kind"),
+            },
+            "warnings": warnings,
+            "blockers": blockers,
+        }
+    )
+    if blockers:
+        result.update({"status": "blocked", "exit_code": 1})
+        return result
+    if not apply:
+        result.update(
+            {
+                "status": "planned",
+                "exit_code": 0,
+                "target_repo_writes": target_repo_writes(False, reason="batch dry-run only"),
+            }
+        )
+        return result
+
+    previous_report = latest_update_report(repo)
+    previous_report_path = previous_report.get("path") if previous_report else None
+    update_result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    report = latest_update_report(repo)
+    if report and report.get("path") == previous_report_path:
+        report = None
+    if update_result.returncode != 0:
+        result.update(
+            {
+                "status": "failed",
+                "exit_code": update_result.returncode,
+                "stdout": update_result.stdout,
+                "stderr": update_result.stderr,
+            }
+        )
+        return result
+
+    registry = register_target_repo(repo, "target update-all")
+    result.update(
+        {
+            "status": "updated",
+            "exit_code": 0,
+            "update_report": report.get("path") if isinstance(report, dict) else None,
+            "target_registry": {"path": registry["path"], "target_count": registry["target_count"]},
+            "target_repo_writes": target_repo_writes(True, paths=[str(repo)], reason="batch target update apply"),
+        }
+    )
+    return result
+
+
+def target_update_all_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    registry = read_target_registry()
+    targets = list(registry.get("targets") or [])
+    apply = bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
+    results = [target_update_all_run_target(args, entry, apply=apply) for entry in targets]
+    status_counts: dict[str, int] = {}
+    for item in results:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    failed_statuses = {"blocked", "failed", "invalid-registry-entry", "missing", "not-git", "not-installed", "skipped-dirty"}
+    failed_count = sum(status_counts.get(status, 0) for status in failed_statuses)
+    write_paths = [item["root"] for item in results if (item.get("target_repo_writes") or {}).get("performed")]
+    next_commands: list[str] = []
+    if status_counts.get("missing") or status_counts.get("invalid-registry-entry"):
+        next_commands.append(public_command("target", "prune-missing", "--dry-run"))
+    if targets and not apply and not failed_count:
+        next_commands.append(public_command("target", "update-all", "--apply"))
+    if not targets:
+        next_commands.append(public_command("setup", "--repo", "/path/to/repo"))
+    exit_code = 1 if failed_count else 0
+    payload = {
+        "schema_version": 1,
+        "command": "target-update-all",
+        "mode": "apply" if apply else "dry-run",
+        "registry": {
+            "path": str(target_registry_path()),
+            "target_count": len(targets),
+            "updated_at": registry.get("updated_at"),
+        },
+        "target_repo_writes": target_repo_writes(bool(write_paths), paths=write_paths, reason="batch target updates" if write_paths else "batch dry-run or no target writes"),
+        "sidecar_writes": sidecar_writes(False),
+        "summary": {
+            "total": len(results),
+            "failed": failed_count,
+            "statuses": status_counts,
+        },
+        "targets": results,
+        "next_commands": next_commands,
+        "exit_code": exit_code,
+    }
+    return payload, exit_code
+
+
+def target_prune_missing_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    registry = read_target_registry()
+    targets = list(registry.get("targets") or [])
+    apply = bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
+    kept: list[dict[str, Any]] = []
+    prunable: list[dict[str, Any]] = []
+    for entry in targets:
+        root = entry.get("root")
+        item = {
+            "root": root,
+            "id": entry.get("id"),
+            "name": entry.get("name"),
+            "registered_at": entry.get("registered_at"),
+            "last_seen_at": entry.get("last_seen_at"),
+        }
+        if not root:
+            item.update({"status": "invalid-registry-entry", "error": "Registry entry has no root path."})
+            prunable.append(item)
+            continue
+        if not Path(str(root)).expanduser().exists():
+            item.update({"status": "missing", "error": "Registered target path does not exist."})
+            prunable.append(item)
+            continue
+        kept.append(entry)
+
+    performed = bool(apply and prunable)
+    if performed:
+        registry.update(
+            {
+                "schema_version": 1,
+                "path": str(target_registry_path()),
+                "updated_at": now(),
+                "targets": kept,
+            }
+        )
+        write_target_registry(registry)
+
+    next_commands: list[str] = []
+    if prunable and not apply:
+        next_commands.append(public_command("target", "prune-missing", "--apply"))
+    if apply:
+        next_commands.append(public_command("update", "--all", "--dry-run"))
+    if not targets:
+        next_commands.append(public_command("setup", "--repo", "/path/to/repo"))
+
+    payload = {
+        "schema_version": 1,
+        "command": "target-prune-missing",
+        "mode": "apply" if apply else "dry-run",
+        "registry": {
+            "path": str(target_registry_path()),
+            "target_count": len(targets),
+            "updated_at": registry.get("updated_at"),
+        },
+        "summary": {
+            "total": len(targets),
+            "kept": len(kept),
+            "prunable": len(prunable),
+            "pruned": len(prunable) if performed else 0,
+        },
+        "targets": prunable,
+        "target_repo_writes": target_repo_writes(False, reason="registry prune never writes target repos"),
+        "sidecar_writes": sidecar_writes(
+            performed,
+            paths=[str(target_registry_path())] if performed else [],
+            reason="pruned missing target registry entries" if performed else "dry-run or no missing registry entries",
+        ),
+        "next_commands": next_commands,
+        "exit_code": 0,
+    }
+    return payload, 0
+
+
+def render_target_prune_missing(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    registry = payload.get("registry") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} target prune-missing:", style, "1;36"))
+    print(f" - mode: {payload.get('mode')}")
+    print(f" - registry: {registry.get('path')}")
+    print(f" - targets: {summary.get('total', 0)}")
+    print(f" - prunable: {summary.get('prunable', 0)}")
+    print(f" - pruned: {summary.get('pruned', 0)}")
+    for item in payload.get("targets") or []:
+        root = item.get("root") or "(unknown)"
+        status = item.get("status") or "unknown"
+        print(f"   - {status}: {root}")
+    if payload.get("next_commands"):
+        print(" - next commands:")
+        for command in payload["next_commands"]:
+            print(f"   - {command}")
+
+
+def render_target_list(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    registry = payload.get("registry") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} target list:", style, "1;36"))
+    print(f" - registry: {registry.get('path')}")
+    print(f" - targets: {summary.get('total', 0)}")
+    for status, count in sorted((summary.get("statuses") or {}).items()):
+        print(f" - {status}: {count}")
+    for item in payload.get("targets") or []:
+        print(f"   - {item.get('status', 'unknown')}: {item.get('root')}")
+
+
+def render_target_import(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    registry = payload.get("registry") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} target import:", style, "1;36"))
+    print(f" - mode: {payload.get('mode')}")
+    print(f" - registry: {registry.get('path')}")
+    print(f" - scanned: {summary.get('scanned', 0)}")
+    print(f" - would import: {summary.get('would_import', 0)}")
+    print(f" - imported: {summary.get('imported', 0)}")
+    print(f" - already registered: {summary.get('already_registered', 0)}")
+    print(f" - skipped: {summary.get('skipped', 0)}")
+    for item in payload.get("targets") or []:
+        status = item.get("status") or "unknown"
+        detail = f" ({item.get('skip_reason')})" if item.get("skip_reason") else ""
+        print(f"   - {status}: {item.get('root')}{detail}")
+    if payload.get("next_commands"):
+        print(" - next commands:")
+        for command in payload["next_commands"]:
+            print(f"   - {command}")
+
+
+def render_target_update_all(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    registry = payload.get("registry") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} target update-all:", style, "1;36"))
+    print(f" - mode: {payload.get('mode')}")
+    print(f" - registry: {registry.get('path')}")
+    print(f" - targets: {summary.get('total', 0)}")
+    print(f" - failed/skipped: {summary.get('failed', 0)}")
+    for status, count in sorted((summary.get("statuses") or {}).items()):
+        print(f" - {status}: {count}")
+    for item in payload.get("targets") or []:
+        root = item.get("root") or "(unknown)"
+        status = item.get("status") or "unknown"
+        plan = item.get("plan") or {}
+        detail = ""
+        if plan:
+            detail = f" ({plan.get('actions', 0)} actions, {plan.get('conflicts', 0)} conflicts, {plan.get('blockers', 0)} blockers)"
+        print(f"   - {status}: {root}{detail}")
+    if payload.get("next_commands"):
+        print(" - next commands:")
+        for command in payload["next_commands"]:
+            print(f"   - {command}")
+
+
+def render_worktree_audit(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} worktree audit:", style, "1;36"))
+    print(f" - worktrees: {summary.get('total', 0)}")
+    print(f" - removable: {summary.get('removable', 0)}")
+    print(f" - blocked: {summary.get('blocked', 0)}")
+    print(f" - dirty: {summary.get('dirty', 0)}")
+    for item in payload.get("worktrees") or []:
+        blockers = ",".join(item.get("blockers") or [])
+        detail = f" ({blockers})" if blockers else ""
+        print(f"   - {item.get('status', 'unknown')}: {item.get('root')}{detail}")
+
+
+def render_worktree_prune(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} worktree prune:", style, "1;36"))
+    print(f" - mode: {payload.get('mode')}")
+    print(f" - worktrees: {summary.get('total', 0)}")
+    print(f" - would remove: {summary.get('would_remove', 0)}")
+    print(f" - removed: {summary.get('removed', 0)}")
+    print(f" - blocked: {summary.get('blocked', 0)}")
+    print(f" - failed: {summary.get('failed', 0)}")
+    for item in payload.get("worktrees") or []:
+        prune_status = item.get("prune_status") or item.get("status") or "unknown"
+        blockers = ",".join(item.get("blockers") or [])
+        detail = f" ({blockers})" if blockers else ""
+        print(f"   - {prune_status}: {item.get('root')}{detail}")
+    if payload.get("next_commands"):
+        print(" - next commands:")
+        for command in payload["next_commands"]:
+            print(f"   - {command}")
+
+
 def latest_update_report(repo: Path) -> dict[str, Any] | None:
     updates_dir = repo / ".doc-contract-kit" / "updates"
     if not updates_dir.exists():
@@ -8165,6 +9662,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_style_arg(doctor)
     doctor.add_argument("--strict", action="store_true", help="Exit non-zero when startup blockers are present.")
     doctor.add_argument("--write-sidecar", action="store_true", help="Write a doctor receipt under the repo sidecar.")
+
+    closeout_plan = subparsers.add_parser(
+        "closeout-plan",
+        help="Plan whether current work can be claimed done from dirty state, task, receipt, and closeout evidence.",
+    )
+    add_common_repo_args(closeout_plan)
+    closeout_plan.add_argument("--format", choices=["text", "json"], default=None)
+    closeout_plan.add_argument("--strict", action="store_true", help="Exit non-zero when completion cannot be claimed cleanly.")
 
     self_cmd = subparsers.add_parser("self", help="Inspect or update the global repo-contract-kit tool checkout.")
     self_subparsers = self_cmd.add_subparsers(dest="self_command", required=True, parser_class=KitArgumentParser)
@@ -8541,6 +10046,21 @@ def build_parser() -> argparse.ArgumentParser:
     add_install_args(target_add)
     target_status = target_subparsers.add_parser("status", help="Show current or selected target repo install status.")
     add_common_repo_args(target_status)
+    target_list = target_subparsers.add_parser("list", help="List registered target repos used by batch updates.")
+    target_list.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(target_list)
+    target_import = target_subparsers.add_parser(
+        "import",
+        help="Seed the registered target list from installed kit repos under a scan root.",
+    )
+    target_import.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(target_import)
+    target_import.add_argument("--root", action="append", help="Root directory to scan for installed target repos. Defaults to the current directory.")
+    target_import.add_argument("--exclude", action="append", help="Additional fnmatch pattern to exclude from import.")
+    target_import.add_argument("--include-agent-worktrees", action="store_true", help="Include paths containing agent-worktrees. Excluded by default.")
+    target_import.add_argument("--include-archive", action="store_true", help="Include paths under archive directories. Excluded by default.")
+    target_import.add_argument("--dry-run", action="store_true", help="Preview registry import without writing. This is the default.")
+    target_import.add_argument("--apply", action="store_true", help="Write eligible installed primary repos to the local kit registry.")
     target_doctor = target_subparsers.add_parser(
         "doctor",
         help="Diagnose dirty state, task/worktree state, and safe recovery commands for a target repo.",
@@ -8580,6 +10100,42 @@ def build_parser() -> argparse.ArgumentParser:
     target_update.add_argument("--metadata-only", action="store_true")
     target_update.add_argument("--force-managed", action="store_true")
     target_update.add_argument("--verbose", action="store_true", help="Show raw update script detail after the compact summary.")
+    target_update_all = target_subparsers.add_parser(
+        "update-all",
+        help="Dry-run or apply updates to every registered enrolled target repo.",
+    )
+    target_update_all.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(target_update_all)
+    target_update_all.add_argument("--dry-run", action="store_true", help="Plan every registered target update without writing files. This is the default.")
+    target_update_all.add_argument("--apply", action="store_true", help="Apply updates to clean registered targets. Dirty targets are skipped.")
+    target_update_all.add_argument("--preset")
+    target_update_all.add_argument("--profiles")
+    target_update_all.add_argument("--runtime-adapter", action="append")
+    target_update_all.add_argument("--runtime-adapters")
+    target_update_all.add_argument("--metadata-only", action="store_true")
+    target_update_all.add_argument("--force-managed", action="store_true")
+    target_prune_missing = target_subparsers.add_parser(
+        "prune-missing",
+        help="Remove registered target repos whose paths no longer exist.",
+    )
+    target_prune_missing.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(target_prune_missing)
+    target_prune_missing.add_argument("--dry-run", action="store_true", help="Preview missing registry entries without writing. This is the default.")
+    target_prune_missing.add_argument("--apply", action="store_true", help="Remove missing registry entries from the local kit registry.")
+
+    worktree = subparsers.add_parser("worktree", help="Audit and prune disposable agent worktrees.")
+    worktree_subparsers = worktree.add_subparsers(dest="worktree_command", required=True, parser_class=KitArgumentParser)
+    worktree_audit = worktree_subparsers.add_parser("audit", help="Audit disposable agent worktrees under one or more repo or directory roots.")
+    worktree_audit.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(worktree_audit)
+    worktree_audit.add_argument("--root", action="append", help="Repo or directory root to scan. Defaults to the current directory.")
+    worktree_prune = worktree_subparsers.add_parser("prune", help="Remove clean disposable linked worktrees under agent-worktrees paths from repo or directory roots.")
+    worktree_prune.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(worktree_prune)
+    worktree_prune.add_argument("--root", action="append", help="Repo or directory root to scan. Defaults to the current directory.")
+    worktree_prune.add_argument("--dry-run", action="store_true", help="Preview removable worktrees without deleting them. This is the default.")
+    worktree_prune.add_argument("--apply", action="store_true", help="Remove eligible clean linked worktrees.")
+    worktree_prune.add_argument("--force", action="store_true", help="Pass --force to git worktree remove for eligible clean worktrees.")
 
     migrate_config = subparsers.add_parser(
         "migrate-config",
@@ -8593,6 +10149,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_style_arg(update)
     update.add_argument("--kit", default=str(ROOT), help="kit checkout to update from. Defaults to this checkout.")
     update.add_argument("--global", action="store_true", dest="global_update", help="Update the global tool checkout instead of a target repo.")
+    update.add_argument("--all", action="store_true", dest="all_targets", help="Update every registered enrolled target repo. Defaults to dry-run unless --apply is set.")
     update.add_argument("--ref", default=os.environ.get("REPO_CONTRACT_KIT_REF", "main"), help="Branch or tag to fetch for --global. Default: main.")
     update.add_argument(
         "--workflow-ref",
@@ -8693,6 +10250,34 @@ def main(argv: list[str] | None = None) -> int:
         payload, exit_code = self_update_payload(args)
         render_json(payload) if args.json else render_self_update(payload)
         return exit_code
+    if args.command == "update" and getattr(args, "all_targets", False):
+        payload, exit_code = target_update_all_payload(args)
+        render_json(payload) if args.json else render_target_update_all(payload, style=render_style(args))
+        return exit_code
+    if args.command == "target" and getattr(args, "target_command", "") == "update-all":
+        payload, exit_code = target_update_all_payload(args)
+        render_json(payload) if args.json else render_target_update_all(payload, style=render_style(args))
+        return exit_code
+    if args.command == "target" and getattr(args, "target_command", "") == "list":
+        payload, exit_code = target_list_payload(args)
+        render_json(payload) if args.json else render_target_list(payload, style=render_style(args))
+        return exit_code
+    if args.command == "target" and getattr(args, "target_command", "") == "import":
+        payload, exit_code = target_import_payload(args)
+        render_json(payload) if args.json else render_target_import(payload, style=render_style(args))
+        return exit_code
+    if args.command == "target" and getattr(args, "target_command", "") == "prune-missing":
+        payload, exit_code = target_prune_missing_payload(args)
+        render_json(payload) if args.json else render_target_prune_missing(payload, style=render_style(args))
+        return exit_code
+    if args.command == "worktree" and getattr(args, "worktree_command", "") == "audit":
+        payload, exit_code = worktree_audit_payload(args)
+        render_json(payload) if args.json else render_worktree_audit(payload, style=render_style(args))
+        return exit_code
+    if args.command == "worktree" and getattr(args, "worktree_command", "") == "prune":
+        payload, exit_code = worktree_prune_payload(args)
+        render_json(payload) if args.json else render_worktree_prune(payload, style=render_style(args))
+        return exit_code
 
     try:
         repo = require_git_repo(args.repo)
@@ -8744,6 +10329,11 @@ def main(argv: list[str] | None = None) -> int:
         output_format = args.format or ("json" if args.json else "text")
         render_json(payload) if output_format == "json" else render_agent_state_ledger(payload)
         return 0
+    if args.command == "closeout-plan":
+        payload = apply_runtime_mode(closeout_plan_payload(args, repo), raw_argv, args)
+        output_format = args.format or ("json" if args.json else "text")
+        render_json(payload) if output_format == "json" else render_closeout_plan(payload)
+        return payload["exit_code"]
     if args.command == "branch-readiness":
         payload, exit_code = branch_readiness.build_report(args, repo)
         output_format = args.format or ("json" if args.json else "text")

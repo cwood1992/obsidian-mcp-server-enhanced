@@ -41,6 +41,7 @@ make agent-task-prepare TASK=<id> SCOPE=<paths>
 make agent-task-heartbeat TASK=<id>
 make agent-task-finalize TASK=<id> TASK_RECEIPT=<path>
 make agent-task-finish TASK=<id> TASK_RECEIPT=<path>
+kit closeout-plan --json
 make agent-token-budget
 make agent-receipt-verify
 make agent-verify
@@ -131,6 +132,13 @@ reports `target_repo_writes=false` and `sidecar_writes=false`; it is not a
 cleanup, closeout, finalizer, automation handoff, self-heal apply, or receipt
 writer.
 
+`kit closeout-plan --json` translates the ledger, task status, dirty checkout,
+receipt, and closeout preview evidence into a completion decision. Run it after
+validation and before the final handoff. If `can_claim_done=false`, report the
+`completion_state`, `claim_blockers`, and `next_action` instead of saying the
+work is done. Use `--strict` when the shell command should fail until closeout
+is clean.
+
 `make agent-branch-readiness` emits a no-write branch-or-PR readiness report for
 the point just before a human considers PR update, merge queue, auto-merge, or
 branch-protection governance. Use `BRANCH_READY_JSON=1` for machine-readable
@@ -188,11 +196,22 @@ For update management, prefer the global CLI:
 kit status
 kit update --dry-run
 kit update
+kit target import --root /path/to/repos --dry-run
+kit target list --json
+kit update --all --dry-run
+kit worktree audit --root /path/to/repos --json
+kit worktree prune --root /path/to/repos --dry-run
 kit doctor
 ```
 
 `make kit-explain` prints the ownership boundary for installed kit files. Use it
 when the repo's root `Makefile` or installed scripts look like project code.
+`kit update --all --dry-run` previews registered enrolled target repos from the
+local kit registry. `kit update --all --apply` may update clean registered
+targets and skips dirty, missing, or no-longer-enrolled targets. Use
+`kit target import --root <root> --dry-run` to seed existing primary repos;
+agent-worktree and archive paths are excluded by default. Use `kit worktree
+audit` and `kit worktree prune --dry-run` for disposable task worktrees.
 The target repo owns the root `Makefile`; the kit-owned targets live in
 `.doc-contract-kit/make/repo-contract.mk` and are exposed by including that
 fragment.
@@ -374,8 +393,11 @@ overlaps another active task. Dirty-primary baseline mode records tracked and
 untracked entries, counts, changed files, HEAD, and a deterministic
 content-sensitive state hash in the task metadata and receipt template; later
 `agent-task-ready` / `agent-task-finalize` runs block if the primary checkout
-changed after that baseline. `ALLOW_DIRTY=1` remains a legacy alias for the same
-baseline mode. Keep the default `OVERLAP=warn` while triaging.
+changed after that baseline. Because the task worktree starts from HEAD,
+prepare blocks dirty-baseline runs when untracked files overlap the declared
+task scope; commit or park those files first. `ALLOW_DIRTY=1` remains a legacy
+alias for the same baseline mode. Keep the default `OVERLAP=warn` while
+triaging.
 The metadata records run id, owner/session id, optional `TASK_OWNER_LABEL`,
 `TASK_THREAD_ID`, and `TASK_AUTOMATION_ID`, heartbeat timestamp, lease expiry,
 active sibling tasks, and overlap warnings. Long-running workers should

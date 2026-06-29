@@ -41,6 +41,9 @@ If asked to review, understand, clean up, or formalize this repo, start here:
 `kit start --json` decides the route and reports `local_update` status.
 `make agent-start` is the installed target-repo packet lane, and
 `make agent-context-bundle` is the compact handoff context lane.
+`kit status --json` separates `git_worktree_state` from `kit_managed_state`;
+use the first for real Git dirt and the second for managed template/proposal
+review. Run `kit closeout-plan --json` before claiming write work is done.
 
 The prompts under `.codex/prompts/` are local copies installed by
 `repo-contract-kit`. Do not fetch prompts from another repo during normal work
@@ -95,6 +98,11 @@ kit setup
 kit status
 kit update --dry-run
 kit update
+kit target import --root /path/to/repos --dry-run
+kit target list --json
+kit update --all --dry-run
+kit worktree audit --root /path/to/repos --json
+kit worktree prune --root /path/to/repos --dry-run
 kit doctor
 ```
 
@@ -106,7 +114,12 @@ Use `make kit-update KIT=/path/to/kit` or
 `make kit-refresh KIT=/path/to/kit` only when the global CLI is
 unavailable or a specific local checkout is required. Preserve customized
 managed files and review `.doc-contract-kit/updates/` before accepting proposed
-replacements. Use `make kit-explain` when ownership is unclear.
+replacements. Use `kit update --all --apply` only after reviewing the batch
+dry-run; dirty registered targets are skipped. Use `kit target import` only for
+primary repos, with agent-worktree and archive paths excluded by default. Use
+`kit worktree audit` and `kit worktree prune --dry-run` for disposable task
+worktrees instead of enrolling them globally. Use `make kit-explain` when
+ownership is unclear.
 
 For external agent artifacts, use the source kit CLI with `--repo <path>`;
 `sidecar-init` and `--write-sidecar` store packets, plans, and receipts outside
@@ -124,6 +137,8 @@ the primary checkout, not inside an existing task worktree. Use
 `make agent-task-status` before parallel work, `make agent-task-ready` before PR
 or merge handoff, and preview `agent-task-cleanup` / `agent-task-closeout`
 before setting their apply flags.
+If `DIRTY_PRIMARY_BASELINE=1` is intentional, commit or park untracked files in
+the task scope first; the task worktree is created from HEAD.
 
 ## Instruction hygiene
 
