@@ -155,6 +155,13 @@ interface AuthenticatedClient {
   scopeString: string;
 }
 
+interface FacadeActionResult {
+  vaultId: string;
+  payload: unknown;
+  resultPath?: string;
+  taskLineNumber?: number;
+}
+
 const ACTION_SCOPES: Record<ChatGptFacadeActionRequest["action"], string> = {
   search: OBSIDIAN_READ_SCOPE,
   fetch: OBSIDIAN_READ_SCOPE,
@@ -559,10 +566,7 @@ export async function startChatGptFacade(
           });
         }
         sendJson(res, 200, {
-          success: true,
-          action: parsed.data.action,
-          vault: result.vaultId,
-          data: result.payload,
+          ...formatFacadeActionResponse(parsed.data.action, result),
           correlationId,
         });
         return;
@@ -939,7 +943,11 @@ async function callAuditedFacadeTool(
     content: [
       {
         type: "text" as const,
-        text: JSON.stringify(result.payload, null, 2),
+        text: JSON.stringify(
+          formatFacadeActionResponse(request.action, result),
+          null,
+          2,
+        ),
       },
     ],
     isError: false,
@@ -950,12 +958,7 @@ async function executeFacadeAction(
   request: ChatGptFacadeActionRequest,
   vaultManager: VaultManager,
   context: RequestContext,
-): Promise<{
-  vaultId: string;
-  payload: unknown;
-  resultPath?: string;
-  taskLineNumber?: number;
-}> {
+): Promise<FacadeActionResult> {
   const vaultId = request.vault || vaultManager.getDefaultVaultId();
   const obsidianService = vaultManager.getVaultService(vaultId, context);
   const vaultCacheService = vaultManager.getVaultCacheService(vaultId, context);
@@ -1127,6 +1130,25 @@ async function executeFacadeAction(
       };
     }
   }
+}
+
+function formatFacadeActionResponse(
+  action: ChatGptFacadeActionRequest["action"],
+  result: FacadeActionResult,
+): Record<string, unknown> {
+  const response: Record<string, unknown> = {
+    success: true,
+    action,
+    vault: result.vaultId,
+  };
+  if (result.resultPath) {
+    response.resultPath = result.resultPath;
+  }
+  if (typeof result.taskLineNumber === "number") {
+    response.taskLineNumber = result.taskLineNumber;
+  }
+  response.data = result.payload;
+  return response;
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -2736,6 +2758,7 @@ function escapeHtml(value: string): string {
 }
 
 export const __test = {
+  formatFacadeActionResponse,
   pkceS256,
   validateAuthorizePayload,
 };

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ChatGPT facade action responses now use a consistent success/action/vault/data
+  envelope across HTTP and facade MCP calls, and expose `resultPath` or
+  `taskLineNumber` when write actions can identify the affected note location.
 - ChatGPT facade OAuth now returns and rotates refresh tokens so connector
   clients can recover from expired one-hour bearer tokens without repeated
   manual reauthorization, and 401 responses now include an OAuth

@@ -16,6 +16,11 @@ import {
 const tempDir = mkdtempSync(join(tmpdir(), "obsidian-chatgpt-facade-"));
 
 try {
+  process.env.OBSIDIAN_API_KEY ||= "selftest-obsidian-api-key";
+  process.env.CHATGPT_FACADE_VAULT_PATHS ||= JSON.stringify({
+    default: tempDir,
+  });
+
   assert.equal(
     normalizeScopes(OBSIDIAN_WRITE_SCOPE, [
       OBSIDIAN_READ_SCOPE,
@@ -127,6 +132,38 @@ try {
     correlationId: "test-correlation",
   });
   assert.equal(store.listAuditEntries(1)[0].action, "append_note");
+
+  const { __test } = await import("./facade.js");
+  const createDailyNoteResponse = __test.formatFacadeActionResponse(
+    "create_daily_note",
+    {
+      vaultId: "default",
+      resultPath: "01-Daily-Notes/2026-07-01.md",
+      payload: {
+        filePath: "01-Daily-Notes/2026-07-01.md",
+        mode: "create",
+        created: true,
+        existing: false,
+        date: "2026-07-01",
+        contentLength: 42,
+      },
+    },
+  );
+  assert.equal(createDailyNoteResponse.success, true);
+  assert.equal(createDailyNoteResponse.action, "create_daily_note");
+  assert.equal(createDailyNoteResponse.vault, "default");
+  assert.equal(
+    createDailyNoteResponse.resultPath,
+    "01-Daily-Notes/2026-07-01.md",
+  );
+  assert.deepEqual(createDailyNoteResponse.data, {
+    filePath: "01-Daily-Notes/2026-07-01.md",
+    mode: "create",
+    created: true,
+    existing: false,
+    date: "2026-07-01",
+    contentLength: 42,
+  });
 
   console.log("ChatGPT facade auth selftest passed.");
 } finally {

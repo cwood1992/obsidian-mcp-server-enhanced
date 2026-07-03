@@ -486,6 +486,25 @@ smaller than the full local MCP tool set.
 | `create_daily_note` | `obsidian:write`       | Create today's or a specified daily note from the daily-note template. |
 | `overwrite_note` | `obsidian:dangerous-write` | Whole-note overwrite for explicitly trusted clients. |
 
+Successful action responses use the same envelope for HTTP actions and facade
+MCP tool calls:
+
+```json
+{
+  "success": true,
+  "action": "create_daily_note",
+  "vault": "default",
+  "resultPath": "Daily/2026-07-03.md",
+  "data": {
+    "filePath": "Daily/2026-07-03.md"
+  }
+}
+```
+
+Write actions include `resultPath` when the affected vault path is known.
+Task-creation and task-update actions also include `taskLineNumber` when the
+line number is available.
+
 Writes are appended to the local JSONL audit log at
 `CHATGPT_FACADE_AUDIT_PATH`. The audit entry records action, client id, scopes,
 target path, mode, result path, status, and a capped input summary; it does not
