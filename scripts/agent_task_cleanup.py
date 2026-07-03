@@ -384,6 +384,51 @@ def closeout_item(root: Path, item: dict, task: dict | None, receipt: dict | Non
     }
 
 
+def reconciliation_disposition(root: Path, task: dict, tasks_by_path: dict[str, dict]):
+    worktree_value = str(task.get("worktree") or "").strip()
+    worktree = Path(worktree_value).expanduser().resolve() if worktree_value else None
+    exists = bool(worktree and worktree.exists())
+    status = git_status_short(worktree) if exists else {"dirty": None, "entries": [], "error": "worktree path is missing"}
+    receipt = receipt_state(root, worktree or root, task, allow_no_receipt=False)
+    terminal = task.get("status") in TERMINAL_STATUSES
+    reasons = []
+    if not exists:
+        disposition = "missing-worktree"
+        reasons.append("metadata references a missing worktree")
+    elif status.get("dirty"):
+        disposition = "dirty-needs-review"
+        reasons.append("worktree has uncommitted changes")
+    elif terminal and not receipt.get("ok"):
+        disposition = "blocked-by-receipt"
+        reasons.append(receipt.get("reason") or "terminal task lacks durable final receipt")
+    elif terminal:
+        disposition = "clean-to-close"
+        reasons.append("terminal task has a clean worktree and durable receipt evidence")
+    else:
+        disposition = "active"
+        reasons.append(f"task status is not terminal: {task.get('status') or 'unknown'}")
+    if status.get("error") and status.get("error") not in reasons:
+        reasons.append(status["error"])
+    return {
+        "task_id": task_label(task),
+        "status": task.get("status") or "unknown",
+        "scope": task.get("scope") or [],
+        "worktree": str(worktree) if worktree else "",
+        "worktree_exists": exists,
+        "dirty": status.get("dirty"),
+        "metadata_path": task.get("_metadata_path"),
+        "final_receipt": task.get("final_receipt") or "",
+        "receipt": receipt,
+        "disposition": disposition,
+        "reasons": reasons,
+        "apply_supported": False if disposition in {"missing-worktree", "dirty-needs-review", "blocked-by-receipt"} else disposition == "clean-to-close",
+    }
+
+
+def task_reconciliation(root: Path, tasks: list[dict], tasks_by_path: dict[str, dict]):
+    return [reconciliation_disposition(root, task, tasks_by_path) for task in tasks]
+
+
 def closeout_inventory(root: Path, worktrees: list[dict], tasks: list[dict], tasks_by_path: dict[str, dict], args):
     eligible = []
     blocked = []
@@ -475,6 +520,7 @@ def build_report(current_root: Path, args=None):
         if item["classification"] == "move-flat" and not item["target_exists"]
     ]
     closeout = closeout_inventory(root, worktrees, tasks, tasks_by_path, args) if args and args.closeout else empty_closeout_report()
+    reconciliation = task_reconciliation(root, tasks, tasks_by_path)
     return {
         "schema_version": 1,
         "invoked_from": str(current_root),
@@ -485,6 +531,11 @@ def build_report(current_root: Path, args=None):
         "move_candidate_count": len(move_candidates),
         "worktrees": worktrees,
         "move_candidates": move_candidates,
+        "task_reconciliation": reconciliation,
+        "task_reconciliation_counts": {
+            disposition: sum(1 for item in reconciliation if item["disposition"] == disposition)
+            for disposition in sorted({item["disposition"] for item in reconciliation})
+        },
         **closeout,
     }
 
@@ -604,6 +655,13 @@ def render_text(report: dict, actions: list[dict]):
             lines.append(f" - block: {item['path']} ({item['task_id']})")
             for reason in item["reasons"]:
                 lines.append(f"   reason: {reason}")
+        if report.get("task_reconciliation"):
+            lines.append("")
+            lines.append("Task reconciliation:")
+            for item in report["task_reconciliation"]:
+                lines.append(f" - {item['disposition']}: {item['task_id']} ({item['status']})")
+                for reason in item["reasons"]:
+                    lines.append(f"   reason: {reason}")
         if report["closeout_candidate_count"]:
             lines.append("")
             lines.append("To remove eligible finished worktrees:")

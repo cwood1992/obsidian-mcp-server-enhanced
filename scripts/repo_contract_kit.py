@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
 import re
 import shutil
 import shlex
@@ -64,8 +65,11 @@ import check_docs_as_tests  # noqa: E402
 import check_token_budget  # noqa: E402
 import branch_readiness  # noqa: E402
 import changelog_update  # noqa: E402
+import closeout_fix  # noqa: E402
+import closeout_explanations  # noqa: E402
 import docs_explain  # noqa: E402
 import goal_check  # noqa: E402
+from agent_parallel_coordination import build_parallel_context  # noqa: E402
 import kit_status  # noqa: E402
 import lint_agent_docs  # noqa: E402
 
@@ -807,6 +811,116 @@ def worktree_candidate_paths(root: Path) -> list[Path]:
     return sorted(worktree_candidate_source_map(root))
 
 
+def worktree_list_branch(raw: dict[str, str]) -> tuple[str | None, str | None]:
+    raw_branch = raw.get("branch") or None
+    if raw_branch and raw_branch.startswith("refs/heads/"):
+        return raw_branch.removeprefix("refs/heads/"), raw_branch
+    return raw_branch, raw_branch
+
+
+def worktree_list_entry(raw: dict[str, str], *, primary: Path, current: Path) -> dict[str, Any]:
+    raw_path = raw.get("path") or ""
+    path = Path(raw_path).expanduser().resolve() if raw_path else Path("")
+    status = worktree_status(path) if raw_path else {
+        "available": False,
+        "dirty": None,
+        "entries": [],
+        "error": "worktree path is missing",
+    }
+    branch, raw_branch = worktree_list_branch(raw)
+    locked = "locked" in raw
+    prunable = "prunable" in raw
+    disposable = worktree_path_is_disposable(path) if raw_path else False
+    cleanup_candidate = bool(disposable and not path == primary and status.get("dirty") is False)
+    return {
+        "path": str(path) if raw_path else "",
+        "primary": bool(raw_path and path == primary),
+        "current": bool(raw_path and path == current),
+        "branch": branch,
+        "raw_branch_ref": raw_branch,
+        "head": raw.get("HEAD") or "",
+        "detached": "detached" in raw or not branch,
+        "dirty": status.get("dirty"),
+        "changed_count": len(status.get("entries") or []),
+        "status_entries": status.get("entries") or [],
+        "status_error": status.get("error"),
+        "locked": locked,
+        "locked_reason": raw.get("locked") if locked else None,
+        "prunable": prunable,
+        "prunable_reason": raw.get("prunable") if prunable else None,
+        "disposable_path": disposable,
+        "cleanup_candidate": cleanup_candidate,
+    }
+
+
+def worktree_list_error_payload(args: argparse.Namespace, root: Path, status: str, message: str, exit_code: int = 2) -> tuple[dict[str, Any], int]:
+    payload = {
+        "schema_version": 1,
+        "command": "worktree-list",
+        "repo": str(root),
+        "primary": "",
+        "created_at": now(),
+        "summary": {
+            "total": 0,
+            "has_linked_worktrees": False,
+            "linked_count": 0,
+            "dirty_count": 0,
+            "detached_count": 0,
+            "missing_count": 0,
+            "locked_count": 0,
+        },
+        "worktrees": [],
+        "root_errors": [{"root": str(root), "status": status, "error": message}],
+        "target_repo_writes": target_repo_writes(False, reason="worktree list is read-only"),
+        "sidecar_writes": sidecar_writes(False, reason="worktree list is read-only"),
+        "exit_code": exit_code,
+    }
+    return payload, exit_code
+
+
+def worktree_list_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    root = Path(getattr(args, "repo", "") or ".").expanduser().resolve()
+    if not root.exists():
+        return worktree_list_error_payload(args, root, "missing", "Repository path does not exist.")
+    git_root_result = run_git(root, ["rev-parse", "--show-toplevel"])
+    if git_root_result.returncode != 0:
+        return worktree_list_error_payload(
+            args,
+            root,
+            "not-git",
+            git_root_result.stderr.strip() or git_root_result.stdout.strip() or "Not a git repository.",
+        )
+    repo = Path(git_root_result.stdout.strip()).resolve()
+    primary = primary_checkout(repo)
+    raw_worktrees = git_worktrees(primary)
+    worktrees = [worktree_list_entry(raw, primary=primary, current=repo) for raw in raw_worktrees]
+    total = len(worktrees)
+    linked_count = len([item for item in worktrees if not item.get("primary")])
+    summary = {
+        "total": total,
+        "has_linked_worktrees": linked_count > 0,
+        "linked_count": linked_count,
+        "dirty_count": len([item for item in worktrees if item.get("dirty") is True]),
+        "detached_count": len([item for item in worktrees if item.get("detached")]),
+        "missing_count": len([item for item in worktrees if item.get("status_error") == "worktree path is missing"]),
+        "locked_count": len([item for item in worktrees if item.get("locked")]),
+    }
+    payload = {
+        "schema_version": 1,
+        "command": "worktree-list",
+        "repo": str(repo),
+        "primary": str(primary),
+        "created_at": now(),
+        "summary": summary,
+        "worktrees": worktrees,
+        "root_errors": [],
+        "target_repo_writes": target_repo_writes(False, reason="worktree list is read-only"),
+        "sidecar_writes": sidecar_writes(False, reason="worktree list is read-only"),
+        "exit_code": 0,
+    }
+    return payload, 0
+
+
 def worktree_entry(path: Path, discovery_sources: list[str] | None = None) -> dict[str, Any]:
     item: dict[str, Any] = {
         "root": str(path),
@@ -1200,6 +1314,7 @@ def cli_metadata() -> dict[str, Any]:
         "writes_target_repo_by_default": False,
         "mutating_commands": [
             "agent-self-heal --apply",
+            "closeout-fix --apply",
             "install",
             "setup",
             "start",
@@ -1219,6 +1334,7 @@ def cli_metadata() -> dict[str, Any]:
         "sidecar_write_commands": [
             "sidecar-init",
             "agent-self-heal --apply",
+            "closeout-fix --apply",
             "automation-handoff",
             "agent-preflight --write-sidecar",
             "agent-doctor --write-sidecar",
@@ -1371,6 +1487,97 @@ def update_checkout(root: Path, ref: str, label: str) -> tuple[list[dict[str, An
     return steps, checkout_status(root), error, checkout.returncode
 
 
+def installed_macos_app_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    configured = os.environ.get("KIT_COMPANION_INSTALL_PATH")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(
+        [
+            Path("/Applications/KitCompanion.app"),
+            Path.home() / "Applications" / "KitCompanion.app",
+        ]
+    )
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def macos_app_bundle_version(app_path: Path) -> str | None:
+    info_plist = app_path / "Contents" / "Info.plist"
+    if not info_plist.exists():
+        return None
+    try:
+        with info_plist.open("rb") as handle:
+            info = plistlib.load(handle)
+    except Exception:
+        return None
+    version = info.get("CFBundleShortVersionString")
+    return str(version) if version else None
+
+
+def update_installed_macos_app(root: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "skipped",
+        "reason": "",
+        "installed_path": None,
+        "before_version": None,
+        "after_version": None,
+    }
+    if os.environ.get("KIT_COMPANION_UPDATE_ON_GLOBAL_UPDATE", "").lower() in {"0", "false", "no"}:
+        payload["reason"] = "disabled by KIT_COMPANION_UPDATE_ON_GLOBAL_UPDATE"
+        return payload
+    if sys.platform != "darwin":
+        payload["reason"] = "not macOS"
+        return payload
+
+    installed_path = next((candidate for candidate in installed_macos_app_candidates() if candidate.exists()), None)
+    if installed_path is None:
+        payload["reason"] = "Kit Companion is not installed"
+        return payload
+
+    install_script = root / "script" / "install_macos_app.sh"
+    payload["installed_path"] = str(installed_path)
+    payload["before_version"] = macos_app_bundle_version(installed_path)
+    payload["command"] = str(install_script)
+    if not install_script.exists():
+        payload["status"] = "failed"
+        payload["reason"] = f"missing installer script: {install_script}"
+        payload["exit_code"] = 2
+        return payload
+
+    env = os.environ.copy()
+    env.setdefault("KIT_COMPANION_INSTALL_PATH", str(installed_path))
+    result = subprocess.run(
+        [str(install_script)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    payload.update(
+        {
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "after_version": macos_app_bundle_version(installed_path),
+        }
+    )
+    if result.returncode == 0:
+        payload["status"] = "applied"
+        payload["reason"] = "installed Kit Companion app refreshed from updated tool checkout"
+    else:
+        payload["status"] = "failed"
+        payload["reason"] = "installer script failed"
+    return payload
+
+
 def self_update_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     before = self_status_payload()["tool"]
     workflow_before = self_status_payload()["workflow_source"]
@@ -1389,6 +1596,14 @@ def self_update_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     tool_steps, tool_after, tool_error, tool_exit = update_checkout(ROOT, args.ref, "repo-contract-kit")
     payload["steps"].extend(tool_steps)
     payload["tool_after"] = tool_after or self_status_payload()["tool"]
+    payload["tool_update"] = {
+        "before_version": before.get("version") or "unknown",
+        "after_version": payload["tool_after"].get("version") or "unknown",
+        "before_ref": before.get("source_ref"),
+        "after_ref": payload["tool_after"].get("source_ref"),
+        "before_short_ref": before.get("short_ref"),
+        "after_short_ref": payload["tool_after"].get("short_ref"),
+    }
     if tool_error:
         payload["error"] = tool_error
         payload["exit_code"] = tool_exit
@@ -1409,6 +1624,10 @@ def self_update_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     else:
         payload["workflow_source_after"] = workflow_before
         payload["workflow_source_skipped"] = True
+    macos_app_update = update_installed_macos_app(ROOT)
+    payload["macos_app_update"] = macos_app_update
+    if macos_app_update.get("status") == "failed":
+        payload["warnings"].append(f"Kit Companion app update failed: {macos_app_update.get('reason')}")
     payload["exit_code"] = 0
     return payload, 0
 
@@ -1416,9 +1635,19 @@ def self_update_payload(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 def render_self_update(payload: dict[str, Any]) -> None:
     before = payload["tool_before"]
     after = payload.get("tool_after") or before
+    tool_update = payload.get("tool_update") or {}
     print(f"{PUBLIC_COMMAND} global update:")
     print(f" - root: {before['root']}")
-    print(f" - ref: {before.get('short_ref') or 'unknown'} -> {after.get('short_ref') or 'unknown'}")
+    print(
+        " - version: "
+        f"{tool_update.get('before_version') or before.get('version') or 'unknown'} -> "
+        f"{tool_update.get('after_version') or after.get('version') or 'unknown'}"
+    )
+    print(
+        " - source ref: "
+        f"{tool_update.get('before_short_ref') or before.get('short_ref') or 'unknown'} -> "
+        f"{tool_update.get('after_short_ref') or after.get('short_ref') or 'unknown'}"
+    )
     workflow_before = payload.get("workflow_source_before") or {}
     workflow_after = payload.get("workflow_source_after") or workflow_before
     if workflow_before.get("exists") or workflow_after.get("exists") or workflow_before.get("is_git_checkout") or workflow_after.get("is_git_checkout"):
@@ -1427,6 +1656,20 @@ def render_self_update(payload: dict[str, Any]) -> None:
         print(f" - ref: {workflow_before.get('short_ref') or 'unknown'} -> {workflow_after.get('short_ref') or 'unknown'}")
     for warning in payload.get("warnings", []):
         print(f" - warning: {warning}")
+    app_update = payload.get("macos_app_update") or {}
+    if app_update:
+        status = app_update.get("status")
+        path = app_update.get("installed_path")
+        if status == "applied":
+            print("optional macOS app update:")
+            print(f" - path: {path}")
+            print(f" - version: {app_update.get('before_version') or 'unknown'} -> {app_update.get('after_version') or 'unknown'}")
+        elif status == "failed":
+            print("optional macOS app update:")
+            print(f" - path: {path or 'unknown'}")
+            print(f" - error: {app_update.get('reason') or 'unknown'}")
+        else:
+            print(f"optional macOS app update: skipped ({app_update.get('reason') or 'not applicable'})")
     if payload.get("error"):
         print(f" - error: {payload['error']}")
     for step in payload.get("steps", []):
@@ -1483,9 +1726,9 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
         ("start",): {
             "audience": ["human", "agent"],
             "mutation": "writes-target-conditionally",
-            "target_repo_write": "local-safe managed-file update by default for installed target repos; never with --no-update",
+            "target_repo_write": "local-safe managed-file update only for clean installed target repos; never with --no-update",
             "sidecar_write": "never",
-            "route_note": "`kit start` is the canonical first command for choosing human, agent, setup, maintenance, and release-gated journeys; installed targets may receive local-safe managed-file updates.",
+            "route_note": "`kit start` is the canonical first command for choosing human, agent, setup, maintenance, and release-gated journeys; clean installed targets may receive local-safe managed-file updates.",
             "examples": [
                 public_command("start"),
                 public_command("start", "--no-update"),
@@ -1652,7 +1895,7 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
             "route_role": "canonical",
             "canonical_command": "closeout-plan",
             "alias_group": "task-closeout",
-            "route_note": "`kit closeout-plan` translates task, dirty-state, receipt, and closeout evidence into whether work can truthfully be claimed done.",
+            "route_note": "`kit closeout-plan` translates dirty state, disposable-worktree prune diagnostics, task-ledger blockers, receipts, and closeout evidence into whether work can truthfully be claimed done.",
             "examples": [
                 public_command("closeout-plan", "--repo", "/path/to/repo", "--json"),
                 public_command("closeout-plan", "--repo", "/path/to/repo", "--strict"),
@@ -1668,7 +1911,59 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
                 "completion_state",
                 "next_action",
                 "claim_blockers",
+                "blocker_explanations",
+                "human_summary",
                 "exit_code",
+            ],
+            "behavior_notes": [
+                "JSON output includes human_summary and blocker_explanations so callers can show the user what is blocked, why it blocks closeout, and the next safe action.",
+            ],
+        },
+        ("closeout-fix",): {
+            "audience": ["human", "agent", "app"],
+            "mutation": "launches-write-agent",
+            "sidecar_write": "with --apply",
+            "target_repo_write": "via launched agent in --apply mode",
+            "route_role": "canonical",
+            "canonical_command": "closeout-fix",
+            "alias_group": "task-closeout",
+            "route_note": "`kit closeout-fix` supervises a headless closeout agent for one repo: preview is read-only, while --apply writes sidecar job receipts, lets the agent make logical commits, prunes only eligible clean disposable worktrees, verifies strict closeout, and pushes without force.",
+            "examples": [
+                public_command("closeout-fix", "--repo", "/path/to/repo", "--json"),
+                public_command("closeout-fix", "--repo", "/path/to/repo", "--apply", "--jsonl"),
+                public_command("closeout-fix", "--repo", "/path/to/repo", "--apply", "--no-push", "--json"),
+            ],
+            "output_schema": "closeout_fix_payload",
+            "docs": [
+                "README.md",
+                "docs/agent-guide.md",
+                "docs/human-guide.md",
+                "docs/macos-companion.md",
+                "docs/cli-reference.md",
+            ],
+            "stable_payload_fields": [
+                "schema_version",
+                "command",
+                "job_id",
+                "job_dir",
+                "result_path",
+                "runner",
+                "initial_closeout",
+                "commits",
+                "branches_pushed",
+                "worktrees_pruned",
+                "receipts",
+                "final_closeout",
+                "blockers",
+                "blocker_explanations",
+                "human_summary",
+                "result",
+                "target_repo_writes",
+                "sidecar_writes",
+                "exit_code",
+            ],
+            "behavior_notes": [
+                "Blocked apply runs are first-class workflow outcomes. The final JSON/JSONL payload includes result=blocked, human_summary, blocker_explanations, and result_path; the shell exit code is distinct from supervisor or tool failure.",
             ],
         },
         ("self",): {
@@ -1697,9 +1992,23 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
             "route_role": "maintainer",
             "canonical_command": "self update",
             "alias_group": "global-tool",
-            "route_note": "Updates the global tool checkout; target repos still use `kit update`.",
+            "route_note": "Updates the global tool checkout; when Kit Companion is installed on macOS, refreshes the optional app from the updated checkout.",
             "examples": [public_command("self", "update", "--json")],
             "output_schema": "self_update_payload",
+            "stable_payload_fields": [
+                "schema_version",
+                "command",
+                "tool_update",
+                "workflow_source_after",
+                "macos_app_update",
+                "warnings",
+                "target_repo_writes",
+                "sidecar_writes",
+                "exit_code",
+            ],
+            "behavior_notes": [
+                "On macOS, global updates refresh an installed Kit Companion app from the updated checkout. Machines without the app skip this optional step.",
+            ],
         },
         ("sidecar-init",): {
             "audience": ["human", "agent"],
@@ -2066,8 +2375,18 @@ def command_map_annotations() -> dict[tuple[str, ...], dict[str, Any]]:
             "audience": ["human", "agent"],
             "mutation": "namespace",
             "json_supported": False,
-            "examples": [public_command("worktree", "audit", "--root", "/path/to/repo-or-parent", "--json")],
+            "examples": [
+                public_command("worktree", "list", "--repo", "/path/to/repo", "--json"),
+                public_command("worktree", "audit", "--root", "/path/to/repo-or-parent", "--json"),
+            ],
             "output_schema": "subcommand_namespace",
+        },
+        ("worktree", "list"): {
+            "audience": ["human", "agent"],
+            "mutation": "read-only",
+            "route_note": "Lists every Git-linked worktree for one repository, including ordinary siblings, detached checkouts, Codex worktrees, and kit task worktrees. This is visibility-only and does not classify cleanup safety.",
+            "examples": [public_command("worktree", "list", "--repo", "/Volumes/Myrtle/MiniProjects/MiniCommand", "--json")],
+            "output_schema": "worktree_list_payload",
         },
         ("worktree", "audit"): {
             "audience": ["human", "agent"],
@@ -3752,13 +4071,14 @@ def compact_task_status(repo: Path, limits: dict[str, int], omissions: list[dict
         for task in tasks
     ]
     hazards = payload.get("hazards", []) if isinstance(payload.get("hazards"), list) else []
+    parallel_context = payload.get("parallel_context") if isinstance(payload.get("parallel_context"), dict) else build_parallel_context(payload)
     warnings = []
     if result.returncode:
         warnings.append(result.stderr.strip() or result.stdout.strip() or "agent-task-status returned non-zero")
-    if hazards:
-        warnings.append("Task status reported coordination hazards.")
-    if payload.get("stale_tasks"):
-        warnings.append("Task status reported stale task metadata.")
+    if parallel_context.get("blockers"):
+        warnings.append("Task status reported write-task coordination blockers.")
+    if parallel_context.get("warnings"):
+        warnings.append("Task status reported write-task coordination warnings.")
     status = "warning" if warnings else "ok"
     return bundle_section(
         status,
@@ -3771,6 +4091,9 @@ def compact_task_status(repo: Path, limits: dict[str, int], omissions: list[dict
             "stale_task_count": len(payload.get("stale_tasks", []) or []),
             "unknown_scope_task_count": len(payload.get("unknown_scope_tasks", []) or []),
             "untracked_agent_worktree_count": len(payload.get("untracked_agent_worktrees", []) or []),
+            "parallel_context": parallel_context,
+            "can_start_write_task": bool(parallel_context.get("can_start_write_task")),
+            "recommended_next_command": parallel_context.get("recommended_next_command"),
             "tasks": bounded_list(compact_tasks, limits["tasks"], omissions, "task_status", "tasks", "task list was truncated"),
         },
         warnings,
@@ -4093,6 +4416,7 @@ def agent_state_ledger_payload(args: argparse.Namespace, repo: Path) -> dict[str
         receipt_paths.append((finalizer_dir, "target-final-receipts", "receipt.json"))
     receipts = scan_json_receipts(receipt_paths)
     tasks, task_blockers, task_warnings = ledger_task_summaries(primary, task_status)
+    parallel_context = task_status.get("parallel_context") if isinstance(task_status.get("parallel_context"), dict) else build_parallel_context(task_status)
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     blockers.extend(task_blockers)
@@ -4159,8 +4483,12 @@ def agent_state_ledger_payload(args: argparse.Namespace, repo: Path) -> dict[str
             "unknown_scope_tasks": task_status.get("unknown_scope_tasks", []),
             "dirty_worktree_tasks": task_status.get("dirty_worktree_tasks", []),
             "untracked_agent_worktrees": task_status.get("untracked_agent_worktrees", []),
+            "parallel_context": parallel_context,
+            "can_start_write_task": bool(parallel_context.get("can_start_write_task")),
+            "recommended_next_command": parallel_context.get("recommended_next_command"),
             "tasks": tasks,
         },
+        "parallel_context": parallel_context,
         "closeout_state": {
             "source_command": "make agent-task-closeout TASK_CLOSEOUT_JSON=1",
             "exit_code": closeout_code,
@@ -4193,6 +4521,8 @@ def render_agent_state_ledger(payload: dict[str, Any]) -> None:
     print(f" - dirty checkout: {str(dirty.get('dirty')).lower()} ({dirty.get('count', 0)} changed)")
     print(f" - sidecar available: {str((payload.get('sidecar') or {}).get('available')).lower()}")
     print(f" - tasks: {task_summary.get('active_task_count', 0)} active / {task_summary.get('task_count', 0)} total")
+    parallel_context = payload.get("parallel_context") or (payload.get("task_status") or {}).get("parallel_context") or {}
+    print(f" - can start write task: {str(parallel_context.get('can_start_write_task')).lower()}")
     print(f" - closeout candidates: {(payload.get('closeout_state') or {}).get('closeout_candidate_count', 0)}")
     if unresolved.get("blockers"):
         print(" - blockers:")
@@ -4265,6 +4595,62 @@ def closeout_plan_relevant_blocked_items(items: list[dict[str, Any]]) -> list[di
     return relevant
 
 
+def closeout_plan_protected_worktree_paths(tasks: list[dict[str, Any]]) -> set[str]:
+    protected: set[str] = set()
+    for task in tasks:
+        is_active_with_live_lease = task.get("status") == "in-progress" and not task.get("stale_lease")
+        needs_receipt_evidence = bool(task.get("missing_final_receipt"))
+        if not is_active_with_live_lease and not needs_receipt_evidence:
+            continue
+        worktree = task.get("worktree")
+        if not worktree:
+            continue
+        protected.add(str(Path(str(worktree)).expanduser().resolve()))
+    return protected
+
+
+def closeout_plan_worktree_prune(primary: Path, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    audit_args = argparse.Namespace(root=[str(primary)])
+    entries, root_errors = worktree_audit_entries(audit_args)
+    summary = worktree_summary(entries)
+    protected_paths = closeout_plan_protected_worktree_paths(tasks)
+    protected_removable = [
+        entry
+        for entry in entries
+        if entry.get("removable") and str(Path(str(entry.get("root"))).expanduser().resolve()) in protected_paths
+    ]
+    unprotected_removable = [
+        entry
+        for entry in entries
+        if entry.get("removable") and str(Path(str(entry.get("root"))).expanduser().resolve()) not in protected_paths
+    ]
+    blocked = [entry for entry in entries if entry.get("status") == "blocked"]
+    dry_run_command = public_command("worktree", "prune", "--root", str(primary), "--dry-run", "--json")
+    apply_command = public_command("worktree", "prune", "--root", str(primary), "--apply", "--json")
+    next_commands: list[str] = []
+    if unprotected_removable and not protected_removable:
+        next_commands.append(dry_run_command)
+        next_commands.append(apply_command)
+    elif blocked:
+        next_commands.append(public_command("worktree", "audit", "--root", str(primary), "--json"))
+    return {
+        "source_command": public_command("worktree", "audit", "--root", str(primary), "--json"),
+        "dry_run_command": dry_run_command,
+        "apply_command": apply_command,
+        "root_errors": root_errors,
+        "summary": {
+            **summary,
+            "would_remove": len(unprotected_removable),
+            "protected_removable": len(protected_removable),
+            "unprotected_removable": len(unprotected_removable),
+        },
+        "blocked": blocked,
+        "removable_sample": [entry.get("root") for entry in unprotected_removable[:10]],
+        "protected_removable_sample": [entry.get("root") for entry in protected_removable[:10]],
+        "next_commands": next_commands,
+    }
+
+
 def task_brief(task: dict[str, Any]) -> dict[str, Any]:
     return {
         "task_id": task.get("task_id"),
@@ -4297,6 +4683,7 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
     ledger = agent_state_ledger_payload(args, primary)
     dirty = ledger.get("dirty") or {}
     task_status = ledger.get("task_status") or {}
+    parallel_context = ledger.get("parallel_context") or task_status.get("parallel_context") or {}
     task_summary = task_status.get("summary") or {}
     tasks = task_status.get("tasks") or []
     closeout = ledger.get("closeout_state") or {}
@@ -4316,8 +4703,14 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
         for task in tasks
         if task.get("missing_worktree") or task.get("stale_lease") or task.get("active_overlap")
     ]
+    worktree_prune = closeout_plan_worktree_prune(primary, tasks)
+    worktree_prune_summary = worktree_prune.get("summary") or {}
+    worktree_prune_would_remove = int(worktree_prune_summary.get("would_remove") or 0)
+    worktree_prune_protected_removable = int(worktree_prune_summary.get("protected_removable") or 0)
+    worktree_prune_blocked = int(worktree_prune_summary.get("blocked") or 0)
 
     claim_blockers: list[dict[str, Any]] = []
+    task_ledger_blockers: list[dict[str, Any]] = []
     if dirty.get("dirty"):
         claim_blockers.append(
             {
@@ -4326,8 +4719,34 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
                 "count": dirty.get("count", 0),
             }
         )
-    if active_tasks:
+    if worktree_prune_would_remove:
         claim_blockers.append(
+            {
+                "code": "worktree_prune_candidates",
+                "message": "Clean disposable linked worktrees can be pruned before task-ledger closeout.",
+                "count": worktree_prune_would_remove,
+                "dry_run_command": worktree_prune.get("dry_run_command"),
+                "apply_command": worktree_prune.get("apply_command"),
+            }
+        )
+    if worktree_prune_blocked:
+        claim_blockers.append(
+            {
+                "code": "worktree_prune_blocked",
+                "message": "One or more disposable linked worktrees are blocked from pruning, usually because they are dirty.",
+                "count": worktree_prune_blocked,
+            }
+        )
+    if worktree_prune_protected_removable:
+        claim_blockers.append(
+            {
+                "code": "active_worktree_prune_risk",
+                "message": "A non-expired active task worktree is clean but should not be broad-pruned before task handoff.",
+                "count": worktree_prune_protected_removable,
+            }
+        )
+    if active_tasks:
+        task_ledger_blockers.append(
             {
                 "code": "active_tasks",
                 "message": "One or more task records are still in progress.",
@@ -4335,7 +4754,7 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
             }
         )
     if terminal_missing_receipts:
-        claim_blockers.append(
+        task_ledger_blockers.append(
             {
                 "code": "missing_final_receipts",
                 "message": "Terminal task metadata is missing durable final receipt evidence.",
@@ -4343,7 +4762,7 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
             }
         )
     if dirty_worktree_tasks:
-        claim_blockers.append(
+        task_ledger_blockers.append(
             {
                 "code": "dirty_task_worktrees",
                 "message": "One or more task worktrees have uncommitted changes.",
@@ -4351,15 +4770,23 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
             }
         )
     if blocked_task_states:
-        claim_blockers.append(
+        task_ledger_blockers.append(
             {
                 "code": "blocked_task_state",
                 "message": "Task metadata has missing, stale, or overlapping worktree state.",
                 "count": len(blocked_task_states),
             }
         )
+    if parallel_context.get("blockers"):
+        task_ledger_blockers.append(
+            {
+                "code": "parallel_context_blockers",
+                "message": "Parallel coordination reported blockers for starting or closing write-task work.",
+                "count": len(parallel_context.get("blockers") or []),
+            }
+        )
     if closeout.get("closeout_candidate_count", 0):
-        claim_blockers.append(
+        task_ledger_blockers.append(
             {
                 "code": "closeout_candidates",
                 "message": "Finished task worktrees are eligible for reviewed closeout.",
@@ -4367,7 +4794,7 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
             }
         )
     if closeout_blocked_count:
-        claim_blockers.append(
+        task_ledger_blockers.append(
             {
                 "code": "closeout_blocked",
                 "message": "Closeout preview has blocked worktrees that need inspection.",
@@ -4390,19 +4817,26 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
         if item.get("code") not in {"missing_final_receipt", "active_overlap", "missing_worktree"}
     ]
     if external_blockers:
-        claim_blockers.append(
+        task_ledger_blockers.append(
             {
                 "code": "external_blockers",
                 "message": "Ledger reported automation, receipt, or other repository blockers.",
                 "count": len(external_blockers),
             }
         )
+    claim_blockers.extend(task_ledger_blockers)
 
     if dirty.get("dirty"):
         completion_state = "needs-integration"
         next_action = closeout_plan_action(
             "git status --short",
             "Inspect and either preserve, commit, hand off, or explicitly receipt the dirty primary checkout.",
+        )
+    elif worktree_prune_would_remove and not worktree_prune_protected_removable:
+        completion_state = "needs-worktree-prune"
+        next_action = closeout_plan_action(
+            str(worktree_prune.get("dry_run_command")),
+            "Preview clean disposable linked worktrees before resolving task-ledger blockers.",
         )
     elif blocked_task_states or external_blockers or "automation_handoff_blocked" in blocker_codes or "automation_baseline_blocked" in blocker_codes:
         completion_state = "blocked"
@@ -4463,7 +4897,7 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
         code for code in warning_codes if code in {"missing_sidecar", "receipt_warning", "task_status_warning", "closeout_warning"}
     )
     exit_code = 1 if args.strict and not can_claim_done else 0
-    return {
+    payload = {
         "schema_version": 1,
         "command": "closeout-plan",
         "repo": str(primary),
@@ -4481,12 +4915,17 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
         "strict": bool(args.strict),
         "next_action": next_action,
         "claim_blockers": claim_blockers,
+        "task_ledger_blockers": task_ledger_blockers,
         "nonblocking_warnings": nonblocking_warning_codes,
         "git_worktree_state": git_worktree_state,
         "kit_managed_state": kit_managed_state,
+        "worktree_prune": worktree_prune,
         "dirty": dirty,
         "dirty_file_groups": closeout_dirty_file_groups(dirty.get("entries") or []),
         "task_summary": task_summary,
+        "parallel_context": parallel_context,
+        "can_start_write_task": bool(parallel_context.get("can_start_write_task")),
+        "recommended_write_task_command": parallel_context.get("recommended_next_command"),
         "active_tasks": active_tasks,
         "terminal_missing_receipts": terminal_missing_receipts,
         "dirty_worktree_tasks": dirty_worktree_tasks,
@@ -4508,9 +4947,14 @@ def closeout_plan_payload(args: argparse.Namespace, repo: Path) -> dict[str, Any
             "ledger": "make agent-state-ledger STATE_LEDGER_JSON=1",
             "task_status": "make agent-task-status TASK_STATUS_INCLUDE_CLOSED=1 TASK_STATUS_JSON=1",
             "closeout_preview": "make agent-task-closeout TASK_CLOSEOUT_JSON=1",
+            "worktree_audit": worktree_prune.get("source_command"),
+            "worktree_prune": worktree_prune.get("dry_run_command"),
         },
         "exit_code": exit_code,
     }
+    payload["blocker_explanations"] = closeout_explanations.explain_blockers(claim_blockers)
+    payload["human_summary"] = closeout_explanations.closeout_plan_human_summary(payload)
+    return payload
 
 
 def render_closeout_plan(payload: dict[str, Any]) -> None:
@@ -4523,6 +4967,8 @@ def render_closeout_plan(payload: dict[str, Any]) -> None:
     managed_state = payload.get("kit_managed_state") or {}
     task_summary = payload.get("task_summary") or {}
     closeout = payload.get("closeout") or {}
+    worktree_prune = payload.get("worktree_prune") or {}
+    worktree_prune_summary = worktree_prune.get("summary") or {}
     print(f" - dirty checkout: {str(dirty.get('dirty')).lower()} ({dirty.get('count', 0)} changed)")
     if git_state:
         print(f" - git worktree state: {git_state.get('state')} ({git_state.get('count', 0)} changed)")
@@ -4532,11 +4978,34 @@ def render_closeout_plan(payload: dict[str, Any]) -> None:
             f"{managed_state.get('state')} "
             f"({managed_state.get('proposal_count', 0)} proposals; not Git dirt)"
         )
+    if worktree_prune_summary:
+        print(
+            " - disposable worktrees: "
+            f"{worktree_prune_summary.get('would_remove', 0)} removable / "
+            f"{worktree_prune_summary.get('blocked', 0)} blocked "
+            f"({worktree_prune_summary.get('dirty', 0)} dirty)"
+        )
     print(f" - tasks: {task_summary.get('active_task_count', 0)} active / {task_summary.get('task_count', 0)} total")
+    parallel_context = payload.get("parallel_context") or {}
+    if parallel_context:
+        print(f" - can start write task: {str(parallel_context.get('can_start_write_task')).lower()}")
+        print(f" - write-task next command: {parallel_context.get('recommended_next_command')}")
     print(f" - closeout: {closeout.get('candidate_count', 0)} candidate / {closeout.get('blocked_count', 0)} blocked")
     if payload.get("claim_blockers"):
         print(" - claim blockers:")
         for item in payload["claim_blockers"]:
+            print(f"   - {item.get('code')}: {item.get('message')} ({item.get('count', 0)})")
+    summary = payload.get("human_summary") or {}
+    if summary:
+        print(" - explanation:")
+        print(f"   - {summary.get('title')}: {summary.get('plain_reason')}")
+        if summary.get("why_it_blocks"):
+            print(f"   - why: {summary.get('why_it_blocks')}")
+        if summary.get("recommended_action"):
+            print(f"   - how to address: {summary.get('recommended_action')}")
+    if payload.get("task_ledger_blockers"):
+        print(" - task ledger blockers:")
+        for item in payload["task_ledger_blockers"]:
             print(f"   - {item.get('code')}: {item.get('message')} ({item.get('count', 0)})")
     if payload.get("active_tasks"):
         print(" - active tasks:")
@@ -6517,6 +6986,16 @@ def start_local_update_payload(repo: Path, status: dict[str, Any], args: argpars
         }
         for item in unsafe_actions
     ]
+    dirty_target_files = [
+        str(path)
+        for warning in plan.get("warnings") or []
+        if isinstance(warning, dict) and warning.get("code") == "dirty_target_repo"
+        for path in (warning.get("paths") or [])
+    ]
+    if dirty_target_files and write_actions:
+        local_update["blocked_by"] = sorted(set([*local_update["blocked_by"], "dirty-target-repo"]))
+        local_update["dirty_target_files"] = sorted(set(dirty_target_files))
+        local_update["dirty_target_file_count"] = len(set(dirty_target_files))
 
     if not write_actions:
         local_update.update(
@@ -6531,6 +7010,14 @@ def start_local_update_payload(repo: Path, status: dict[str, Any], args: argpars
             {
                 "reason": "local update is available but not safe for automatic start",
                 "next_commands": [command_for_repo(repo, "update", "--dry-run"), command_for_repo(repo, "doctor")],
+            }
+        )
+        return local_update
+    if dirty_target_files and write_actions:
+        local_update.update(
+            {
+                "reason": "local update is available but target repo is dirty",
+                "next_commands": [command_for_repo(repo, "status"), command_for_repo(repo, "update", "--dry-run")],
             }
         )
         return local_update
@@ -7826,6 +8313,7 @@ JSON_CONTRACT_COMMAND_MAP_FIELDS = [
     "canonical_command",
     "output_schema",
     "docs",
+    "behavior_notes",
 ]
 JSON_CONTRACT_STABLE_PAYLOAD_FIELDS = [
     "schema_version",
@@ -7935,6 +8423,7 @@ def command_map_payload(invoked_command: str = "command-map") -> dict[str, Any]:
             "canonical_command": annotation.get("canonical_command") or annotation.get("alias_of") or name,
             "alias_group": annotation.get("alias_group"),
             "route_note": annotation.get("route_note"),
+            "behavior_notes": annotation.get("behavior_notes", []),
             "examples": annotation.get("examples", default_examples(path, json_supported)),
             "exit_codes": annotation.get("exit_codes", default_exit_codes),
             "output_schema": output_schema,
@@ -8145,6 +8634,7 @@ def cli_reference_payload() -> dict[str, Any]:
                 "examples": command.get("examples") or [],
                 "flags": command.get("flags") or [],
                 "docs": command.get("docs") or [],
+                "behavior_notes": command.get("behavior_notes") or [],
             }
         )
         claims.append(
@@ -8213,6 +8703,12 @@ def render_cli_reference_markdown(payload: dict[str, Any]) -> str:
             lines.append("")
             for example in command["examples"]:
                 lines.append(f"- `{example}`")
+            lines.append("")
+        if command["behavior_notes"]:
+            lines.append("Behavior notes:")
+            lines.append("")
+            for note in command["behavior_notes"]:
+                lines.append(f"- {note}")
             lines.append("")
         if command["flags"]:
             lines.append("Flags:")
@@ -8812,6 +9308,7 @@ def render_options(include_advanced: bool = False) -> None:
     print(f"  {PUBLIC_COMMAND} update --all --dry-run  Preview updates for registered target repos")
     print(f"  {PUBLIC_COMMAND} doctor                  Diagnose dirty state and task blockers")
     print(f"  {PUBLIC_COMMAND} closeout-plan           Decide whether work is actually closed out")
+    print(f"  {PUBLIC_COMMAND} closeout-fix --json     Preview supervised dirty-repo closeout")
     print(f"  {PUBLIC_COMMAND} palette                 Search commands in a TTY")
     print(f"  {PUBLIC_COMMAND} completion zsh          Print shell completion code")
     print("")
@@ -9540,6 +10037,37 @@ def render_worktree_audit(payload: dict[str, Any], style: str = "auto") -> None:
         print(f"   - {item.get('status', 'unknown')}: {item.get('root')}{detail}")
 
 
+def render_worktree_list(payload: dict[str, Any], style: str = "auto") -> None:
+    summary = payload.get("summary") or {}
+    print(styled_text(f"{PUBLIC_COMMAND} worktree list:", style, "1;36"))
+    print(f" - repo: {payload.get('repo') or '(unknown)'}")
+    if payload.get("primary"):
+        print(f" - primary: {payload.get('primary')}")
+    print(f" - worktrees: {summary.get('total', 0)}")
+    print(f" - linked: {summary.get('linked_count', 0)}")
+    print(f" - dirty: {summary.get('dirty_count', 0)}")
+    print(f" - detached: {summary.get('detached_count', 0)}")
+    if summary.get("locked_count", 0):
+        print(f" - locked: {summary.get('locked_count', 0)}")
+    for error in payload.get("root_errors") or []:
+        print(f" - error: {error.get('error') or error.get('status') or 'unknown error'}")
+    for item in payload.get("worktrees") or []:
+        flags = []
+        if item.get("primary"):
+            flags.append("primary")
+        if item.get("current"):
+            flags.append("current")
+        if item.get("dirty"):
+            flags.append("dirty")
+        if item.get("detached"):
+            flags.append("detached")
+        if item.get("locked"):
+            flags.append("locked")
+        detail = f" ({', '.join(flags)})" if flags else ""
+        branch = item.get("branch") or "detached"
+        print(f"   - {branch}: {item.get('path')}{detail}")
+
+
 def render_worktree_prune(payload: dict[str, Any], style: str = "auto") -> None:
     summary = payload.get("summary") or {}
     print(styled_text(f"{PUBLIC_COMMAND} worktree prune:", style, "1;36"))
@@ -9685,7 +10213,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-policy",
         choices=START_UPDATE_POLICIES,
         default="local-safe",
-        help="Local update behavior for installed target repos: local-safe applies managed-file updates; check-only only reports.",
+        help="Local update behavior for installed target repos: local-safe applies managed-file updates only when the target is clean; check-only only reports.",
     )
     start.add_argument("--no-update", action="store_true", help="Skip the local update check and apply step.")
 
@@ -9734,6 +10262,23 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_repo_args(closeout_plan)
     closeout_plan.add_argument("--format", choices=["text", "json"], default=None)
     closeout_plan.add_argument("--strict", action="store_true", help="Exit non-zero when completion cannot be claimed cleanly.")
+
+    closeout_fix_parser = subparsers.add_parser(
+        "closeout-fix",
+        help="Launch a supervised headless agent to close out dirty repo state.",
+    )
+    add_common_repo_args(closeout_fix_parser)
+    closeout_fix_parser.add_argument("--apply", action="store_true", help="Run the write-capable closeout job. Preview is the default.")
+    closeout_fix_parser.add_argument("--jsonl", action="store_true", help="Stream sanitized JSONL job events and the final payload.")
+    closeout_fix_parser.add_argument(
+        "--agent",
+        choices=("auto", "codex", "custom"),
+        default="auto",
+        help="Headless runner to launch. auto defaults to local codex exec.",
+    )
+    closeout_fix_parser.add_argument("--agent-command", help="Explicit command for --agent custom. No runner is inferred from adapters.")
+    closeout_fix_parser.add_argument("--timeout-seconds", type=int, default=3600, help="Maximum seconds for each supervised closeout step.")
+    closeout_fix_parser.add_argument("--no-push", action="store_true", help="Leave successful commits local instead of pushing the current branch.")
 
     self_cmd = subparsers.add_parser("self", help="Inspect or update the global repo-contract-kit tool checkout.")
     self_subparsers = self_cmd.add_subparsers(dest="self_command", required=True, parser_class=KitArgumentParser)
@@ -10193,8 +10738,12 @@ def build_parser() -> argparse.ArgumentParser:
     target_prune_missing.add_argument("--dry-run", action="store_true", help="Preview missing registry entries without writing. This is the default.")
     target_prune_missing.add_argument("--apply", action="store_true", help="Remove missing registry entries from the local kit registry.")
 
-    worktree = subparsers.add_parser("worktree", help="Audit and prune disposable agent worktrees.")
+    worktree = subparsers.add_parser("worktree", help="List, audit, and prune Git worktrees.")
     worktree_subparsers = worktree.add_subparsers(dest="worktree_command", required=True, parser_class=KitArgumentParser)
+    worktree_list = worktree_subparsers.add_parser("list", help="List every Git-linked worktree for one repository.")
+    worktree_list.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    add_style_arg(worktree_list)
+    worktree_list.add_argument("--repo", default=".", help="Repository or linked worktree to inspect. Defaults to the current directory.")
     worktree_audit = worktree_subparsers.add_parser("audit", help="Audit disposable agent worktrees under one or more repo or directory roots.")
     worktree_audit.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     add_style_arg(worktree_audit)
@@ -10344,6 +10893,10 @@ def main(argv: list[str] | None = None) -> int:
         payload, exit_code = target_prune_missing_payload(args)
         render_json(payload) if args.json else render_target_prune_missing(payload, style=render_style(args))
         return exit_code
+    if args.command == "worktree" and getattr(args, "worktree_command", "") == "list":
+        payload, exit_code = worktree_list_payload(args)
+        render_json(payload) if args.json else render_worktree_list(payload, style=render_style(args))
+        return exit_code
     if args.command == "worktree" and getattr(args, "worktree_command", "") == "audit":
         payload, exit_code = worktree_audit_payload(args)
         render_json(payload) if args.json else render_worktree_audit(payload, style=render_style(args))
@@ -10408,6 +10961,27 @@ def main(argv: list[str] | None = None) -> int:
         output_format = args.format or ("json" if args.json else "text")
         render_json(payload) if output_format == "json" else render_closeout_plan(payload)
         return payload["exit_code"]
+    if args.command == "closeout-fix":
+        event_sink = None
+        if args.jsonl:
+            def event_sink(event: dict[str, Any]) -> None:
+                print(json.dumps(event, sort_keys=True), flush=True)
+
+        try:
+            if args.apply:
+                payload, exit_code = closeout_fix.apply_payload(args, repo, CLI_ENTRYPOINT, event_sink=event_sink)
+            else:
+                payload, exit_code = closeout_fix.preview_payload(args, repo, CLI_ENTRYPOINT)
+        except Exception as exc:
+            payload, exit_code = closeout_fix.failure_payload(args, repo, exc, event_sink=event_sink)
+
+        if args.jsonl:
+            print(json.dumps({"event": "final-payload", "payload": payload}, sort_keys=True), flush=True)
+        elif args.json:
+            render_json(payload)
+        else:
+            print(closeout_fix.render_text(payload))
+        return exit_code
     if args.command == "branch-readiness":
         payload, exit_code = branch_readiness.build_report(args, repo)
         output_format = args.format or ("json" if args.json else "text")

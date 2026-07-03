@@ -9,6 +9,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import agent_task_status
+from agent_parallel_coordination import build_parallel_context
 import goal_check
 from _agent_scope import parse_scope, paths_overlap
 
@@ -543,6 +545,66 @@ def active_task_context(existing_tasks: list[dict], warnings: list[str]):
     }
 
 
+def parallel_context_payload(report: dict, scope: list[str]):
+    return build_parallel_context(report, requested_scope=scope)
+
+
+def parallel_block_payload(root: Path, task_id: str, scope: list[str], parallel_context: dict):
+    return {
+        "schema_version": 1,
+        "command": "agent-task-prepare",
+        "result": "blocked",
+        "repo": str(root),
+        "task": task_id,
+        "scope": scope,
+        "blockers": parallel_context.get("blockers", []),
+        "warnings": parallel_context.get("warnings", []),
+        "parallel_context": parallel_context,
+        "recommendations": [
+            parallel_context.get("recommended_next_command") or "make agent-task-status TASK_STATUS_STRICT=1",
+            "resolve or close the same-scope task hazard, then rerun agent-task-prepare",
+        ],
+        "exit_code": 1,
+    }
+
+
+def render_parallel_block(payload: dict):
+    lines = [
+        "Parallel task coordination blocks this write worktree.",
+        f"Task: {payload['task']}",
+        f"Scope: {', '.join(payload['scope']) if payload['scope'] else '(unknown)'}",
+        "",
+        "Blockers:",
+    ]
+    for item in payload["blockers"]:
+        task = f" [{item['task_id']}]" if item.get("task_id") else ""
+        lines.append(f" - {item.get('code')}{task}: {item.get('message')}")
+    if payload.get("warnings"):
+        lines.append("")
+        lines.append("Warnings:")
+        for item in payload["warnings"]:
+            task = f" [{item['task_id']}]" if item.get("task_id") else ""
+            lines.append(f" - {item.get('code')}{task}: {item.get('message')}")
+    lines.append("")
+    lines.append("Next safe commands:")
+    for command in payload["recommendations"]:
+        lines.append(f" - {command}")
+    return "\n".join(lines)
+
+
+def ensure_parallel_start_allowed(root: Path, task_id: str, scope: list[str], json_output: bool):
+    status_report = agent_task_status.build_report(root, include_closed=True)
+    parallel_context = parallel_context_payload(status_report, scope)
+    if not parallel_context.get("can_start_write_task"):
+        payload = parallel_block_payload(root, task_id, scope, parallel_context)
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(render_parallel_block(payload))
+        raise SystemExit(1)
+    return status_report, parallel_context
+
+
 def build_task_packet(
     args,
     root: Path,
@@ -553,6 +615,7 @@ def build_task_packet(
     existing_tasks: list[dict],
     warnings: list[str],
     primary_baseline: dict | None,
+    parallel_context: dict,
 ):
     title = args.title.strip() if args.title.strip() else f"Implement {args.task}"
     goal_report = goal_check.build_goal_check_report(worktree_path, scope)
@@ -691,6 +754,7 @@ def build_task_packet(
             "notes": "Approval covers preparing the isolated worktree; commit, push, merge, and PR mutation still require human approval.",
         },
         "coordination": active_task_context(existing_tasks, warnings),
+        "parallel_context": parallel_context,
         "primary_checkout_baseline": primary_baseline,
         "handoff": {
             "recommended_prompt": "fix-implementer.md",
@@ -712,6 +776,7 @@ def build_receipt_template(
     existing_tasks: list[dict],
     warnings: list[str],
     primary_baseline: dict | None,
+    parallel_context: dict,
 ):
     return {
         "schema_version": 1,
@@ -761,6 +826,7 @@ def build_receipt_template(
             "heartbeat_at": created_at,
             "lease_expires_at": add_minutes_iso(created_at, args.lease_minutes),
         },
+        "parallel_context": parallel_context,
         "primary_checkout_baseline": primary_baseline,
         "harness_metrics": {
             "context_file_count": 0,
@@ -892,6 +958,7 @@ def main():
     if main_status and dirty_primary_baseline:
         ensure_dirty_baseline_scope_is_materialized(root, args.task, scope, main_status, args.json)
     primary_baseline = checkout_status_snapshot(root, created_at, main_status) if main_status and dirty_primary_baseline else None
+    status_report, parallel_context = ensure_parallel_start_allowed(root, args.task, scope, args.json)
     existing_tasks = active_tasks(root)
     warnings = overlap_warnings(scope, existing_tasks)
     blocking = warnings and args.overlap_policy == "block"
@@ -908,8 +975,8 @@ def main():
         receipt_path = artifact_dir / "receipt.template.json"
         metadata_path = tasks_dir(root) / f"{task_slug}.json"
 
-        write_json(task_packet_path, build_task_packet(args, root, worktree_path, task_slug, scope, created_at, existing_tasks, warnings, primary_baseline))
-        write_json(receipt_path, build_receipt_template(args, root, worktree_path, branch, scope, created_at, run_id, existing_tasks, warnings, primary_baseline))
+        write_json(task_packet_path, build_task_packet(args, root, worktree_path, task_slug, scope, created_at, existing_tasks, warnings, primary_baseline, parallel_context))
+        write_json(receipt_path, build_receipt_template(args, root, worktree_path, branch, scope, created_at, run_id, existing_tasks, warnings, primary_baseline, parallel_context))
         write_json(metadata_path, build_metadata(args, root, worktree_path, branch, scope, created_at, warnings, run_id, primary_baseline))
     finally:
         release_launch_lock(lock)

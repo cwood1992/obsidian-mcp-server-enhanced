@@ -595,7 +595,7 @@
       "source_sha256": "3214ab977ff07aede6b56aa3682ca8147c2e8484856bbacaf55951fb205824b8"
     },
     {
-      "installed_sha256": "03398790c47b9fad58ece88916f8ad6c63f8a812ced5bbe3bfab9d7c039ea887",
+      "installed_sha256": "c1b6d92983c13740a6deb42ad7e1e2c9e8a0e0d99fe7c411d6fb15e90505d49e",
       "managed": false,
       "owner": "target",
       "path": "CHANGELOG.md",
@@ -856,13 +856,13 @@
       "source_sha256": "414aa49804ca805ef2543e388052c34a20d1c63e171558b351a4e387eb072032"
     },
     {
-      "installed_sha256": "e59cd47de48150651ad7c171738d7eba930ed7298bf6526fc8a92e3a6df0e0a9",
+      "installed_sha256": "5fcd7c1fcc9cf5c03998ceef4ac0172adc3a6f81dbc270491b5ec3458594bcdf",
       "managed": true,
       "owner": "kit",
       "path": "schemas/task-packet.schema.json",
       "profile": "common",
       "source": "templates/common/task-packet.schema.json",
-      "source_sha256": "e59cd47de48150651ad7c171738d7eba930ed7298bf6526fc8a92e3a6df0e0a9"
+      "source_sha256": "5fcd7c1fcc9cf5c03998ceef4ac0172adc3a6f81dbc270491b5ec3458594bcdf"
     },
     {
       "installed_sha256": "1a1fe269c775c13f59bce84a7432a503070c1311aff488440045347cc73ebe3a",
@@ -872,6 +872,15 @@
       "profile": "core-scripts",
       "source": "scripts/_agent_scope.py",
       "source_sha256": "1a1fe269c775c13f59bce84a7432a503070c1311aff488440045347cc73ebe3a"
+    },
+    {
+      "installed_sha256": "51932dba2a2aeadd73ff006bfdf75ec2d8b420211ac8f1f380ef8a169a698735",
+      "managed": true,
+      "owner": "kit",
+      "path": "scripts/agent_parallel_coordination.py",
+      "profile": "core-scripts",
+      "source": "scripts/agent_parallel_coordination.py",
+      "source_sha256": "51932dba2a2aeadd73ff006bfdf75ec2d8b420211ac8f1f380ef8a169a698735"
     },
     {
       "installed_sha256": "83bd30a9f6f508cd5c8c67a96c7767b5948c4997edde4e4734aae45cf6c2e363",
@@ -901,13 +910,13 @@
       "source_sha256": "cdc4484ef57ed8da91c1532d4ff797c2797533a34d81ac32ff654a5cc90d2b27"
     },
     {
-      "installed_sha256": "a4f41311b83cc6ae352ef53a08416ee7a0cc9084aa5b8c90186e07290a97f5c1",
+      "installed_sha256": "bf296a0e84568675bb560d0084f30a5fea5712309fa6e7ae3f3db0e1a635c928",
       "managed": true,
       "owner": "kit",
       "path": "scripts/agent_task_cleanup.py",
       "profile": "core-scripts",
       "source": "scripts/agent_task_cleanup.py",
-      "source_sha256": "a4f41311b83cc6ae352ef53a08416ee7a0cc9084aa5b8c90186e07290a97f5c1"
+      "source_sha256": "bf296a0e84568675bb560d0084f30a5fea5712309fa6e7ae3f3db0e1a635c928"
     },
     {
       "installed_sha256": "1831021784283da5c67fe8ee49dac0b4c995c5ac52253341d70efed28b75573c",
@@ -928,13 +937,13 @@
       "source_sha256": "45f390a959e5ca93862b865edca45f4b6e063f9c1bf5195d4c385e3cead45f21"
     },
     {
-      "installed_sha256": "7317abd1deee888c64825462bd7fd8e75f2da2d63f79000161d8a66e9dbb4bc2",
+      "installed_sha256": "049d446308d6ed936817d75d5c916b6b91761ffecf3a4bc90c05da34589a45a0",
       "managed": true,
       "owner": "kit",
       "path": "scripts/agent_task_prepare.py",
       "profile": "core-scripts",
       "source": "scripts/agent_task_prepare.py",
-      "source_sha256": "7317abd1deee888c64825462bd7fd8e75f2da2d63f79000161d8a66e9dbb4bc2"
+      "source_sha256": "049d446308d6ed936817d75d5c916b6b91761ffecf3a4bc90c05da34589a45a0"
     },
     {
       "installed_sha256": "e260d44af2434d99ea54bdcfda07d8065cd90080a2c3a17d3082c6d47095aa48",
@@ -946,13 +955,13 @@
       "source_sha256": "e260d44af2434d99ea54bdcfda07d8065cd90080a2c3a17d3082c6d47095aa48"
     },
     {
-      "installed_sha256": "8fa49839591f7f1e799c5711218f182744c505a4d6db7ab3827dfa9684260182",
+      "installed_sha256": "aaa94ad6f9c2e4d510829323a2ed3938df8ff241f87dfa7f3c2e0ac7e635abf7",
       "managed": true,
       "owner": "kit",
       "path": "scripts/agent_task_status.py",
       "profile": "core-scripts",
       "source": "scripts/agent_task_status.py",
-      "source_sha256": "8fa49839591f7f1e799c5711218f182744c505a4d6db7ab3827dfa9684260182"
+      "source_sha256": "aaa94ad6f9c2e4d510829323a2ed3938df8ff241f87dfa7f3c2e0ac7e635abf7"
     },
     {
       "installed_sha256": "0e8ce2a237aac34d93b24f1f69dcd5ee322f7a5096439b91b1a2ffd9e6fc3ebc",
@@ -1018,6 +1027,24 @@
       "source_sha256": "5d5e488cc48259e52c37982ea66aafd327751f2d827e71af0c94cbb147bff80d"
     },
     {
+      "installed_sha256": "0881a7810ee7af29257be93d4ae34706ef529c01b4d3bfe5a35af7f594e99ea8",
+      "managed": true,
+      "owner": "kit",
+      "path": "scripts/closeout_explanations.py",
+      "profile": "core-scripts",
+      "source": "scripts/closeout_explanations.py",
+      "source_sha256": "0881a7810ee7af29257be93d4ae34706ef529c01b4d3bfe5a35af7f594e99ea8"
+    },
+    {
+      "installed_sha256": "bbf33e262c6f4f313cdb35dab32dfb0409afd7cf7bfd8706677ccf9a026368fc",
+      "managed": true,
+      "owner": "kit",
+      "path": "scripts/closeout_fix.py",
+      "profile": "core-scripts",
+      "source": "scripts/closeout_fix.py",
+      "source_sha256": "bbf33e262c6f4f313cdb35dab32dfb0409afd7cf7bfd8706677ccf9a026368fc"
+    },
+    {
       "installed_sha256": "8ae5001db05902e1766f86eaaf4d42465cf071f57c88b6cbf2cce2eb724dd13b",
       "managed": true,
       "owner": "kit",
@@ -1036,13 +1063,13 @@
       "source_sha256": "95d1926af61ee1c73b9d825281ff0f56fe90084018632c90b571886b4d88347a"
     },
     {
-      "installed_sha256": "767f0d39f6733c31f89bd78b244370828eac9453655ee91704c3bfa2580cd35f",
+      "installed_sha256": "20be9ad8da8a14b3ddbe5aa0ceef8ce38c6798758d0b7b0cc7e6e7a16c57f34d",
       "managed": true,
       "owner": "kit",
       "path": "scripts/kit_status.py",
       "profile": "core-scripts",
       "source": "scripts/kit_status.py",
-      "source_sha256": "767f0d39f6733c31f89bd78b244370828eac9453655ee91704c3bfa2580cd35f"
+      "source_sha256": "20be9ad8da8a14b3ddbe5aa0ceef8ce38c6798758d0b7b0cc7e6e7a16c57f34d"
     },
     {
       "installed_sha256": "a1bac6068f5b9e6047f73a64944b6be4b510d9a1edc3c1b96b5027509f32b698",
@@ -1054,13 +1081,13 @@
       "source_sha256": "a1bac6068f5b9e6047f73a64944b6be4b510d9a1edc3c1b96b5027509f32b698"
     },
     {
-      "installed_sha256": "f9817c1ded8b990c64bcd7f1f5abf26bdba83909c5b9f8896ab127269b6f28e1",
+      "installed_sha256": "e8d8cc514b949f2b1823093d93e5d55a423e378a46e6d4ec2e005c10f5e372a8",
       "managed": true,
       "owner": "kit",
       "path": "scripts/lint_agent_docs.py",
       "profile": "core-scripts",
       "source": "scripts/lint_agent_docs.py",
-      "source_sha256": "f9817c1ded8b990c64bcd7f1f5abf26bdba83909c5b9f8896ab127269b6f28e1"
+      "source_sha256": "e8d8cc514b949f2b1823093d93e5d55a423e378a46e6d4ec2e005c10f5e372a8"
     },
     {
       "installed_sha256": "2179ad7ea215e62bee4bf4594ce5783ebcf268d119d52953c4a0038aca741027",
@@ -1081,13 +1108,13 @@
       "source_sha256": "0e91a2a63af412f6d4303b242368c10b15000ca2b76e6ca9cb9b52207e6ed809"
     },
     {
-      "installed_sha256": "89884dcb955bd22204e05ec66902994b6c3a5c68dc843e4c7c320cf6fee68acf",
+      "installed_sha256": "e3e53850d36c75de64774b3ec532e43548fccb5367c97f0fc4875b5eb9858f0e",
       "managed": true,
       "owner": "kit",
       "path": "scripts/repo_contract_kit.py",
       "profile": "core-scripts",
       "source": "scripts/repo_contract_kit.py",
-      "source_sha256": "89884dcb955bd22204e05ec66902994b6c3a5c68dc843e4c7c320cf6fee68acf"
+      "source_sha256": "e3e53850d36c75de64774b3ec532e43548fccb5367c97f0fc4875b5eb9858f0e"
     },
     {
       "installed_sha256": "21a2e186d9f5b3cd6658bd3b23a8f0cc433738f635c912ccb37af00f879300a0",
@@ -1108,8 +1135,8 @@
       "source_sha256": "fe1994438d11bb503fb450231084f58eae8d1c2514172356bf60ccf2fbb968d1"
     }
   ],
-  "generated_at": "2026-06-29T22:23:38+00:00",
-  "kit_version": "0.6.35",
+  "generated_at": "2026-07-03T06:25:54+00:00",
+  "kit_version": "0.6.52",
   "preset": "agentic",
   "profile_config_schema_version": 1,
   "profiles": [
@@ -1136,9 +1163,9 @@
       "templates/common/research-source-report.schema.json",
       "templates/common/research-synthesis.schema.json"
     ],
-    "snapshot_sha256": "979a2eb202fb391760ed8ce617b956ec5ba87a2f1c948622e0591f52b791235f",
+    "snapshot_sha256": "7ad88e9605884a1c6763f67e62ea9399eb071918dbfaf91793502b483e0ba5b6",
     "source_prompt_root": "workflows/prompts",
-    "source_ref": "76a2db9bcd8a014aa11df3f38f55ce2d86316264",
+    "source_ref": "ebed052367cbe9be2ed4b62972b6b27eae911dbb",
     "source_url": "https://github.com/BoweyLou/repo-contract-kit",
     "vendored_at": "2026-06-18",
     "version": "0.4.60"
@@ -1147,8 +1174,8 @@
   "schema_version": 1,
   "source_components": {
     "repo-contract-kit": {
-      "source_ref": "76a2db9bcd8a014aa11df3f38f55ce2d86316264",
-      "version": "0.6.35"
+      "source_ref": "ebed052367cbe9be2ed4b62972b6b27eae911dbb",
+      "version": "0.6.52"
     },
     "workflow-source": {
       "generated_adapter": "templates/profiles/*/files/.codex/prompts",
@@ -1167,14 +1194,14 @@
         "templates/common/research-source-report.schema.json",
         "templates/common/research-synthesis.schema.json"
       ],
-      "snapshot_sha256": "979a2eb202fb391760ed8ce617b956ec5ba87a2f1c948622e0591f52b791235f",
+      "snapshot_sha256": "7ad88e9605884a1c6763f67e62ea9399eb071918dbfaf91793502b483e0ba5b6",
       "source_prompt_root": "workflows/prompts",
-      "source_ref": "76a2db9bcd8a014aa11df3f38f55ce2d86316264",
+      "source_ref": "ebed052367cbe9be2ed4b62972b6b27eae911dbb",
       "source_url": "https://github.com/BoweyLou/repo-contract-kit",
       "vendored_at": "2026-06-18",
       "version": "0.4.60"
     }
   },
-  "source_ref": "76a2db9bcd8a014aa11df3f38f55ce2d86316264",
-  "source_version": "0.6.35"
+  "source_ref": "ebed052367cbe9be2ed4b62972b6b27eae911dbb",
+  "source_version": "0.6.52"
 }

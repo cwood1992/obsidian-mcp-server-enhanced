@@ -6,6 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from agent_parallel_coordination import build_parallel_context
 from _agent_scope import paths_overlap
 
 # Script flow:
@@ -355,7 +356,7 @@ def build_report(root: Path, include_closed: bool):
         if task.get("dirty")
     ]
     untracked = untracked_agent_worktrees(root, raw_worktrees, tasks)
-    return {
+    report = {
         "schema_version": 1,
         "repo_root": str(root),
         "task_count": len(tasks),
@@ -368,6 +369,8 @@ def build_report(root: Path, include_closed: bool):
         "dirty_worktree_tasks": dirty_worktree_tasks,
         "untracked_agent_worktrees": untracked,
     }
+    report["parallel_context"] = build_parallel_context(report)
+    return report
 
 
 def render_text(report: dict):
@@ -381,6 +384,14 @@ def render_text(report: dict):
         lines.append(" - coordination warnings: yes")
     else:
         lines.append(" - coordination warnings: none")
+    context = report.get("parallel_context") or {}
+    lines.append(f" - can start write task: {str(context.get('can_start_write_task')).lower()}")
+    lines.append(f" - recommended next command: {context.get('recommended_next_command') or 'make agent-task-status'}")
+    if context.get("blockers"):
+        lines.append(" - coordination blockers:")
+        for item in context["blockers"]:
+            task = f" [{item['task_id']}]" if item.get("task_id") else ""
+            lines.append(f"   - {item.get('code')}{task}: {item.get('message')}")
 
     if not report["tasks"]:
         lines.append("")
@@ -429,13 +440,11 @@ def render_text(report: dict):
 
 
 def strict_failures(report: dict):
-    failures = []
-    failures.extend(item["message"] for item in report["hazards"])
-    failures.extend(f"{item['task_id']}: {item['message']}" for item in report["stale_tasks"])
-    failures.extend(f"{item['task_id']}: {item['message']}" for item in report["unknown_scope_tasks"])
-    for item in report["untracked_agent_worktrees"]:
-        failures.append(f"untracked agent worktree: {item['path']}")
-    return failures
+    context = report.get("parallel_context") or {}
+    return [
+        f"{item.get('code')}: {item.get('message')}"
+        for item in context.get("blockers", [])
+    ]
 
 
 def parse_args():

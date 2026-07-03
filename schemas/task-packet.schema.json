@@ -615,6 +615,47 @@
         }
       }
     },
+    "parallel_context": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "active_tasks",
+        "blockers",
+        "warnings",
+        "can_start_write_task",
+        "recommended_next_command"
+      ],
+      "properties": {
+        "active_tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "can_start_write_task": {
+          "type": "boolean"
+        },
+        "recommended_next_command": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "harness_metrics": {
       "type": "object",
       "additionalProperties": true,
