@@ -4,7 +4,9 @@ import path, { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { z } from "zod";
 
-dotenv.config();
+dotenv.config({
+  path: process.env.OBSIDIAN_MCP_ENV_FILE || undefined,
+});
 
 // --- Determine Project Root ---
 /**
@@ -101,6 +103,35 @@ const EnvSchema = z.object({
     .string()
     .default("/.well-known/obsidian-chatgpt-manifest.json"),
   CHATGPT_ACTIONS_PATH: z.string().default("/chatgpt/actions"),
+  CHATGPT_FACADE_HOST: z.string().default("127.0.0.1"),
+  CHATGPT_FACADE_PORT: z.coerce.number().int().positive().default(3020),
+  CHATGPT_FACADE_PUBLIC_URL: z.string().url().optional(),
+  CHATGPT_FACADE_ADMIN_SECRET: z.string().optional(),
+  CHATGPT_FACADE_STORE_PATH: z
+    .string()
+    .default(path.join(projectRoot, "data", "chatgpt-facade-oauth.json")),
+  CHATGPT_FACADE_AUDIT_PATH: z
+    .string()
+    .default(path.join(projectRoot, "logs", "chatgpt-facade-audit.jsonl")),
+  CHATGPT_FACADE_TOKEN_TTL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(3600),
+  CHATGPT_FACADE_REFRESH_TOKEN_TTL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(2592000),
+  CHATGPT_FACADE_SCOPES: z
+    .string()
+    .default("obsidian:read"),
+  CHATGPT_FACADE_ALLOWED_ORIGINS: z.string().optional(),
+  CHATGPT_FACADE_SKIP_OBSIDIAN_CHECK: z
+    .string()
+    .transform((val) => val.toLowerCase() === "true")
+    .default("false"),
+  CHATGPT_FACADE_VAULT_PATHS: z.string().optional(),
   MCP_AUTH_MODE: z.enum(["jwt", "oauth"]).optional(),
   MCP_AUTH_SECRET_KEY: z
     .string()
@@ -220,6 +251,28 @@ if (env.OBSIDIAN_VAULTS) {
   throw new Error("Either OBSIDIAN_VAULTS (multi-vault mode) or OBSIDIAN_API_KEY (single vault mode) must be configured");
 }
 
+let chatgptFacadeVaultPaths: Record<string, string> = {};
+if (env.CHATGPT_FACADE_VAULT_PATHS) {
+  try {
+    const parsed = JSON.parse(env.CHATGPT_FACADE_VAULT_PATHS);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("CHATGPT_FACADE_VAULT_PATHS must be a JSON object");
+    }
+    chatgptFacadeVaultPaths = Object.fromEntries(
+      Object.entries(parsed).map(([vaultId, vaultPath]) => {
+        if (typeof vaultPath !== "string" || vaultPath.trim() === "") {
+          throw new Error(`Vault path for '${vaultId}' must be a non-empty string`);
+        }
+        return [vaultId, vaultPath];
+      }),
+    );
+  } catch (error) {
+    throw new Error(
+      `Failed to parse CHATGPT_FACADE_VAULT_PATHS: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 // --- Directory Ensurance Function ---
 const ensureDirectory = (
   dirPath: string,
@@ -277,11 +330,25 @@ const ensureDirectory = (
 // --- End Directory Ensurance Function ---
 
 const validatedLogsPath = ensureDirectory(env.LOGS_DIR, projectRoot, "logs");
+const validatedChatgptStoreDir = ensureDirectory(
+  dirname(env.CHATGPT_FACADE_STORE_PATH),
+  projectRoot,
+  "ChatGPT facade store directory",
+);
 
 if (!validatedLogsPath) {
   if (process.stderr.isTTY) {
     console.error(
       "FATAL: Logs directory configuration is invalid or could not be created. Please check permissions and path. Exiting.",
+    );
+  }
+  process.exit(1);
+}
+
+if (!validatedChatgptStoreDir) {
+  if (process.stderr.isTTY) {
+    console.error(
+      "FATAL: ChatGPT facade store directory configuration is invalid or could not be created. Please check permissions and path. Exiting.",
     );
   }
   process.exit(1);
@@ -307,6 +374,22 @@ export const config = {
   chatgptLayerEnabled: env.CHATGPT_LAYER_ENABLED,
   chatgptManifestPath: env.CHATGPT_MANIFEST_PATH,
   chatgptActionsPath: env.CHATGPT_ACTIONS_PATH,
+  chatgptFacadeHost: env.CHATGPT_FACADE_HOST,
+  chatgptFacadePort: env.CHATGPT_FACADE_PORT,
+  chatgptFacadePublicUrl: env.CHATGPT_FACADE_PUBLIC_URL,
+  chatgptFacadeAdminSecret: env.CHATGPT_FACADE_ADMIN_SECRET,
+  chatgptFacadeStorePath: env.CHATGPT_FACADE_STORE_PATH,
+  chatgptFacadeAuditPath: env.CHATGPT_FACADE_AUDIT_PATH,
+  chatgptFacadeTokenTtlSeconds: env.CHATGPT_FACADE_TOKEN_TTL_SECONDS,
+  chatgptFacadeRefreshTokenTtlSeconds: env.CHATGPT_FACADE_REFRESH_TOKEN_TTL_SECONDS,
+  chatgptFacadeScopes: env.CHATGPT_FACADE_SCOPES.split(",")
+    .map((scope) => scope.trim())
+    .filter(Boolean),
+  chatgptFacadeAllowedOrigins: env.CHATGPT_FACADE_ALLOWED_ORIGINS?.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+  chatgptFacadeSkipObsidianCheck: env.CHATGPT_FACADE_SKIP_OBSIDIAN_CHECK,
+  chatgptFacadeVaultPaths,
   mcpAuthMode: env.MCP_AUTH_MODE,
   mcpAuthSecretKey: env.MCP_AUTH_SECRET_KEY,
   oauthIssuerUrl: env.OAUTH_ISSUER_URL,

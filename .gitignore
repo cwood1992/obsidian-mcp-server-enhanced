@@ -137,6 +137,10 @@ build/
 *.sql
 *.sqlite
 *.sqlite3
+logs/
+
+# Local runtime state
+data/
 
 # Build and Distribution
 dist/

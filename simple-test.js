@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
-// Simple test to check if tools are accessible
+// Simple test to check if tools are accessible.
 import https from 'https';
 
-const API_KEY = '9ff227bd9a3700574d08b33044d7ba1d426431fa457ded7d4594c63affc3b2b4';
-const BASE_URL = 'https://yannicks-mac-mini.tail9cf43d.ts.net/mcp';
+const API_KEY = process.env.MCP_AUTH_KEY;
+const BASE_URL = process.env.MCP_BASE_URL || 'http://127.0.0.1:3010/mcp';
+
+if (!API_KEY) {
+  throw new Error('Set MCP_AUTH_KEY before running this test.');
+}
 
 async function testMCP() {
   console.log('Testing MCP server basic functionality...\n');
