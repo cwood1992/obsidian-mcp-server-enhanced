@@ -1,10 +1,4 @@
-# Target-owned bridge for repo-contract-kit commands.
-#
-# Keep product-specific targets in this Makefile. The installed kit command
-# surface lives in .doc-contract-kit/make/repo-contract.mk and is updated by
-# `kit update`.
-
-include .doc-contract-kit/make/repo-contract.mk
+# Product targets for the ChatGPT facade. Run via Git Bash / WSL on Windows.
 
 .PHONY: chatgpt-facade chatgpt-facade-health tailscale-funnel-chatgpt tailscale-funnel-chatgpt-disable
 
