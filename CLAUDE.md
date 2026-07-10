@@ -11,6 +11,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Clean & rebuild**: `npm run rebuild` - Cleans dist directory and rebuilds
 - **Format code**: `npm run format` - Formats all TypeScript, JavaScript, JSON, and Markdown files
 
+There is no test suite or linter configured — verification is done by building (`npm run build`), starting the server, and exercising tools via the MCP inspector or curl. Prettier is the only code-quality tooling.
+
 ### Debugging & Inspection
 - **MCP Inspector**: `npm run inspect` - Launch MCP inspector for debugging
 - **Stdio inspector**: `npm run inspect:stdio` - Inspect stdio transport specifically
@@ -22,6 +24,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Fetch API spec**: `npm run fetch:spec` - Fetch Obsidian REST API OpenAPI specification
 
 ## Operational Commands
+
+The commands below and the scripts in `scripts/` (`health-check.sh`, `monitor-mcp.sh`, `setup-autostart.sh`) are written for macOS/Linux. On Windows, run them through Git Bash, or use PowerShell equivalents (`Get-Process node`, `Stop-Process`, `Get-Content logs/combined.log -Wait`, `Get-NetTCPConnection -LocalPort 3010`).
 
 ### Server Lifecycle Management
 - **Check running processes**: `ps aux | grep -E "(node.*dist|obsidian|mcp)" | grep -v grep`
@@ -146,7 +150,7 @@ This is an enhanced MCP (Model Context Protocol) server that provides comprehens
 
 **MCP Server Core** (`src/mcp-server/server.ts`):
 - Creates McpServer instances with capabilities registration
-- Registers 15+ Obsidian tools for vault interaction
+- Registers 19 Obsidian tools for vault interaction (one directory per tool under `src/mcp-server/tools/`)
 - Manages transport selection (stdio vs HTTP)
 
 **Service Layer** (`src/services/`):
@@ -195,7 +199,7 @@ All configuration through environment variables in this priority order:
 3. Default values in `src/config/index.ts`
 
 Critical variables:
-- `MCP_AUTH_KEY`: Authentication key for Claude.ai Remote MCP access (generate with `openssl rand -hex 32`)
+- `MCP_AUTH_KEY`: Authentication key for Claude.ai Remote MCP access (generate with `openssl rand -hex 32`). Required in multi-vault mode; in single-vault mode it falls back to `OBSIDIAN_API_KEY` if unset (see `src/config/index.ts`)
 - `OBSIDIAN_API_KEY`: Required API key from Obsidian plugin (single-vault mode only)
 - `OBSIDIAN_VAULTS`: JSON array of vault configurations (multi-vault mode)
 - `OBSIDIAN_BASE_URL`: Obsidian API endpoint (default: http://127.0.0.1:27123, single-vault mode only)
@@ -248,6 +252,7 @@ OBSIDIAN_VAULTS='[
 - **Default vault**: Tool calls without `vault` parameter use the first configured vault
 - **Specific vault**: Add `vault` parameter to tool calls (e.g., `vault: "work"` or `vault: "personal"`)
 - **Backwards compatibility**: Single-vault configurations continue to work without changes
+- **Partial migration**: Only some tools are vault-aware. `readFile`, `listFiles`, `deleteFile`, `taskQuery`, `tasksQueryBuilder`, and `batchEdit` receive the `VaultManager` and honor the `vault` parameter; the remaining tools are registered with the default vault's service instances only (see `createMcpServerInstance` in `src/mcp-server/server.ts`). When migrating a tool to multi-vault, change its registration to accept `VaultManager` and call `vaultManager.getVaultService(vaultId)`
 
 ### Enhanced Features (This Fork)
 
@@ -314,7 +319,16 @@ OBSIDIAN_VAULTS='[
 - Updated tools receive VaultManager, legacy tools receive default service instances
 - Always check cache readiness before using VaultCacheService
 
+### MCP SDK Usage
+- Register tools with the high-level `server.tool(name, description, zodSchemaShape, handler)` API — it handles schema generation, argument validation, and result formatting
+- Never mix high-level (`server.tool`/`server.resource`) and low-level (`server.setRequestHandler`) registration for the same capability type; the SDK's internal state becomes inconsistent
+- All Obsidian vault access must go through `ObsidianRestApiService` methods — never make direct HTTP calls to the Obsidian API from tool code
+
 ### Authentication & Security
 - API key validation on every Obsidian API request
 - Input sanitization using Zod schemas and custom sanitizers
 - Rate limiting and request context tracking built-in
+
+## Additional Reference
+
+`.clinerules` in the repo root is a detailed developer cheatsheet covering the core utilities (`logger`, `ErrorHandler.tryCatch`, `retryWithDelay`, `requestContextService`, sanitization, rate limiting, token counting) with code examples, plus step-by-step recipes for adding tools and resources. Consult it when implementing new tools or working with the utility layer. Note its directory tree and env-var list predate the multi-vault/ChatGPT-layer work — this file is authoritative where they disagree.
