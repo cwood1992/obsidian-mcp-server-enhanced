@@ -8,6 +8,7 @@ import {
 } from "../../../services/obsidianRestAPI/index.js";
 import { BaseErrorCode, McpError } from "../../../types-global/errors.js";
 import {
+  countTokens,
   createFormattedStatWithTokenCount,
   logger,
   RequestContext,
@@ -213,10 +214,15 @@ export type ObsidianSearchReplaceInput = z.infer<
  * human-readable timestamps and an estimated token count.
  */
 type FormattedStat = {
-  /** Creation time formatted as a standard date-time string. */
-  createdTime: string;
-  /** Last modified time formatted as a standard date-time string. */
-  modifiedTime: string;
+  /**
+   * Creation time formatted as a standard date-time string.
+   * Omitted when the REST API does not expose timestamps for the verification
+   * method used (e.g. HEAD-based 'metadata' verification on plugin versions
+   * that do not send x-obsidian-ctime/mtime headers).
+   */
+  createdTime?: string;
+  /** Last modified time formatted as a standard date-time string. Omitted when unavailable (see createdTime). */
+  modifiedTime?: string;
   /** Estimated token count of the file content (using tiktoken 'gpt-4o'). */
   tokenCountEstimate: number;
 };
@@ -944,7 +950,10 @@ export const processObsidianSearchReplace = async (
     // response is never blocked on a second full content fetch.
     if (targetType === "filePath" && vaultCacheService) {
       const mtime = finalState?.stat.mtime ?? metadataStat?.mtime;
-      if (mtime !== undefined) {
+      // mtime of 0 means the HEAD response lacked real timestamp headers —
+      // don't poison the cache with an epoch-zero mtime; fall through to the
+      // background refresh, which obtains the true stat.
+      if (mtime !== undefined && mtime > 0) {
         const cacheContent = finalState?.content ?? modifiedContent;
         vaultCacheService.setCacheEntry(
           effectiveFilePath!,
@@ -1021,7 +1030,7 @@ export const processObsidianSearchReplace = async (
     );
     formattedStat =
       formattedStatResult === null ? undefined : formattedStatResult;
-  } else if (metadataStat) {
+  } else if (metadataStat && metadataStat.mtime > 0) {
     const formattedStatResult = await createFormattedStatWithTokenCount(
       metadataStat,
       modifiedContent,
@@ -1029,6 +1038,20 @@ export const processObsidianSearchReplace = async (
     );
     formattedStat =
       formattedStatResult === null ? undefined : formattedStatResult;
+  } else if (metadataStat) {
+    // HEAD succeeded (write verified) but the plugin sent no timestamp
+    // headers. Report the token estimate we can compute honestly rather
+    // than formatting epoch-zero timestamps.
+    try {
+      formattedStat = {
+        tokenCountEstimate: await countTokens(modifiedContent, responseContext),
+      };
+    } catch (tokenError) {
+      logger.warning(
+        `Could not estimate token count for verified write: ${tokenError instanceof Error ? tokenError.message : String(tokenError)}`,
+        responseContext,
+      );
+    }
   }
 
   // Build the final response object
