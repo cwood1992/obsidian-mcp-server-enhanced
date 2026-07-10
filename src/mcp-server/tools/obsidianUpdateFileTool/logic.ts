@@ -7,6 +7,7 @@ import {
 } from "../../../services/obsidianRestAPI/index.js";
 import { BaseErrorCode, McpError } from "../../../types-global/errors.js";
 import {
+  countTokens,
   createFormattedStatWithTokenCount,
   logger,
   RequestContext,
@@ -255,10 +256,15 @@ export type ObsidianUpdateFileInput = z.infer<
  * human-readable timestamps and an estimated token count.
  */
 type FormattedStat = {
-  /** Creation time formatted as a standard date-time string. */
-  createdTime: string;
-  /** Last modified time formatted as a standard date-time string. */
-  modifiedTime: string;
+  /**
+   * Creation time formatted as a standard date-time string.
+   * Omitted when the REST API does not expose timestamps for the verification
+   * method used (e.g. HEAD-based 'metadata' verification on plugin versions
+   * that do not send x-obsidian-ctime/mtime headers).
+   */
+  createdTime?: string;
+  /** Last modified time formatted as a standard date-time string. Omitted when unavailable (see createdTime). */
+  modifiedTime?: string;
   /** Estimated token count of the file content (using tiktoken 'gpt-4o'). */
   tokenCountEstimate: number;
 };
@@ -764,7 +770,7 @@ export const processObsidianUpdateFile = async (
     } else if (effectiveVerify === "metadata") {
       // Cheap path: confirm the write via a HEAD request instead of a full content re-fetch.
       const stat = await getFinalMetadata(targetId!, obsidianService, context);
-      if (stat) {
+      if (stat && stat.mtime > 0) {
         const formattedStatResult = await createFormattedStatWithTokenCount(
           stat,
           writtenContent,
@@ -773,6 +779,23 @@ export const processObsidianUpdateFile = async (
         stats = formattedStatResult === null ? undefined : formattedStatResult;
         cacheMtime = stat.mtime;
         cacheContent = writtenContent;
+      } else if (stat) {
+        // HEAD succeeded (write verified) but the plugin did not send
+        // x-obsidian-mtime/ctime headers, so real timestamps are unavailable.
+        // Report what we truly know (token estimate from in-memory content)
+        // rather than fabricating epoch-zero timestamps. Leave cacheMtime
+        // unset so the cache falls back to the background full refresh,
+        // which obtains the real mtime.
+        try {
+          stats = {
+            tokenCountEstimate: await countTokens(writtenContent, context),
+          };
+        } catch (tokenError) {
+          logger.warning(
+            `Could not estimate token count for verified write: ${tokenError instanceof Error ? tokenError.message : String(tokenError)}`,
+            context,
+          );
+        }
       } else {
         verificationNote =
           " (Warning: Could not retrieve final file stats/content after update.)";
