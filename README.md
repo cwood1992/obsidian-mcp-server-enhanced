@@ -592,13 +592,17 @@ All tools support an optional `vault` parameter to specify which vault to operat
 | `obsidian_delete_file`        | Permanently deletes a file from the vault.                | `filePath`, `vault?`                                             |
 | `obsidian_dataview_query`     | Execute Dataview DQL queries against your vault.          | `query`, `vault?`, `format?`                                    |
 | `obsidian_task_query`         | Search and analyze tasks across your vault.               | `vault?`, `status?`, `dateRange?`, `folder?`, `priority?`, `format?` |
-| `obsidian_periodic_notes`     | Create and manage daily, weekly, monthly, yearly notes.   | `operation`, `periodType`, `vault?`, `date?`, `content?`, `append?` |
+| `obsidian_periodic_notes`     | Create and manage daily, weekly, monthly, yearly notes.   | `operation`, `period`, `date?`, `content?`, `template?`, `createIfNotExists?` |
 | `obsidian_block_reference`    | Work with block references and heading operations.        | `operation`, `filePath`, `vault?`, `heading?`, `content?`, `blockId?` |
 | `obsidian_graph_analysis`     | Analyze note connections and vault relationships.         | `operation`, `vault?`, `filePath?`, `minConnections?`, `maxDepth?` |
 | `obsidian_template_system`    | Create files from templates with variable substitution.   | `operation`, `vault?`, `templatePath?`, `targetPath?`, `variables?` |
 | `obsidian_smart_linking`      | Get intelligent link suggestions and recommendations.     | `operation`, `vault?`, `filePath?`, `content?`, `maxSuggestions?` |
 
 _Note: All tools support comprehensive error handling, multi-vault routing, and return structured JSON responses._
+
+### Periodic notes require the companion plugin on Local REST API 5.0.2+
+
+Local REST API release 5.0.2 removed core periodic-note support (the `/periodic/` REST endpoints). On 5.0.2 or later, install and enable the [obsidian-local-rest-api-periodic-notes](https://github.com/coddingtonbear/obsidian-local-rest-api-periodic-notes) companion plugin in each vault, or every `obsidian_periodic_notes` operation fails. This server distinguishes the two 404 cases: a missing route is surfaced as a configuration error naming the companion plugin, while a missing note is reported as not-found for the specific period and date requested. The `date` parameter (`YYYY-MM-DD`) addresses a specific period via `/periodic/{period}/{year}/{month}/{day}/`; omitting it targets the current period.
 
 
 ## License

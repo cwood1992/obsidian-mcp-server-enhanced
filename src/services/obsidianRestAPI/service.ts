@@ -30,6 +30,7 @@ import {
   ObsidianCommand,
   PatchOptions,
   Period,
+  PeriodicNoteDate,
   SimpleSearchResult,
 } from "./types.js"; // Import types from the new file
 
@@ -150,7 +151,10 @@ export class ObsidianRestApiService {
                   ...operationContext,
                   ...errorDetails,
                 });
-                throw new McpError(errorCode, errorMessage, operationContext);
+                throw new McpError(errorCode, errorMessage, {
+                  ...operationContext,
+                  ...errorDetails,
+                });
               // NOTE: We throw immediately after logging debug for 404, skipping the general error log below.
               case 405:
                 errorCode = BaseErrorCode.VALIDATION_ERROR; // Method not allowed often implies incorrect usage
@@ -166,7 +170,10 @@ export class ObsidianRestApiService {
               ...operationContext,
               ...errorDetails,
             });
-            throw new McpError(errorCode, errorMessage, operationContext);
+            throw new McpError(errorCode, errorMessage, {
+              ...operationContext,
+              ...errorDetails,
+            });
           } else if (axiosError.request) {
             // Network error (no response received)
             errorCode = BaseErrorCode.SERVICE_UNAVAILABLE;
@@ -494,12 +501,14 @@ export class ObsidianRestApiService {
     period: Period,
     format: "markdown" | "json" = "markdown",
     context: RequestContext,
+    date?: PeriodicNoteDate,
   ): Promise<string | NoteJson> {
     return periodicNoteMethods.getPeriodicNote(
       this._request.bind(this),
       period,
       format,
       context,
+      date,
     );
   }
 
@@ -514,12 +523,14 @@ export class ObsidianRestApiService {
     period: Period,
     content: string,
     context: RequestContext,
+    date?: PeriodicNoteDate,
   ): Promise<void> {
     return periodicNoteMethods.updatePeriodicNote(
       this._request.bind(this),
       period,
       content,
       context,
+      date,
     );
   }
 
@@ -534,12 +545,14 @@ export class ObsidianRestApiService {
     period: Period,
     content: string,
     context: RequestContext,
+    date?: PeriodicNoteDate,
   ): Promise<void> {
     return periodicNoteMethods.appendPeriodicNote(
       this._request.bind(this),
       period,
       content,
       context,
+      date,
     );
   }
 
@@ -552,11 +565,13 @@ export class ObsidianRestApiService {
   async deletePeriodicNote(
     period: Period,
     context: RequestContext,
+    date?: PeriodicNoteDate,
   ): Promise<void> {
     return periodicNoteMethods.deletePeriodicNote(
       this._request.bind(this),
       period,
       context,
+      date,
     );
   }
 

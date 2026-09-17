@@ -144,3 +144,16 @@ export interface PatchOptions {
  * Type alias for periodic note periods.
  */
 export type Period = "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
+
+/**
+ * A specific calendar date used to address a periodic note via the dated
+ * REST routes (`/periodic/{period}/{year}/{month}/{day}/`). For non-daily
+ * periods the API resolves the period containing this date.
+ */
+export interface PeriodicNoteDate {
+  year: number;
+  /** 1-12 */
+  month: number;
+  /** 1-31 */
+  day: number;
+}
